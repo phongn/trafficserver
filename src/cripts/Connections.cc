@@ -140,7 +140,7 @@ Cript::IP::sample(double rate, uint32_t seed, unsigned ipv4_cidr, unsigned ipv6_
 void
 ConnBase::TcpInfo::initialize()
 {
-#if defined(TCP_INFO) && defined(HAVE_STRUCT_TCP_INFO)
+#if (defined(TCP_INFO) && defined(HAVE_STRUCT_TCP_INFO)) || defined(TCP_CONNECTION_INFO)
   if (!_ready) {
     int connfd = _owner->fd();
 

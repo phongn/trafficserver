@@ -36,13 +36,9 @@
 
 // This is a bit of a hack, to get the more linux specific tcp_info struct ...
 #if HAVE_STRUCT_LINUX_TCP_INFO
-#ifndef _LINUX_TCP_H
-#define _LINUX_TCP_H
-#endif
-#elif HAVE_NETINET_IN_H
-#ifndef _NETINET_TCP_H
-#define _NETINET_TCP_H
-#endif
+#include <linux/tcp.h>
+#elif __has_include(<netinet/tcp.h>)
+#include <netinet/tcp.h>
 #endif
 
 // ConditionStatus
@@ -1331,6 +1327,31 @@ ConditionTcpInfo::append_value(std::string &s, Resources const &res)
       snprintf(buf, sizeof(buf), "%" PRIu32 ";%" PRIu32 ";%" PRIu32 ";%" PRIu32 "", info.tcpi_rtt, info.tcpi_rto,
                info.tcpi_snd_cwnd, info.__tcpi_retrans);
 #endif
+      s += buf;
+    }
+  }
+#elif defined(TCP_CONNECTION_INFO)
+  if (TSHttpTxnIsInternal(res.txnp)) {
+    Dbg(pi_dbg_ctl, "No TCP-INFO available for internal transactions");
+    return;
+  }
+  TSReturnCode tsSsn;
+  int fd;
+  struct tcp_connection_info info;
+  socklen_t tcp_info_len = sizeof(info);
+  tsSsn                  = TSHttpTxnClientFdGet(res.txnp, &fd);
+  if (tsSsn != TS_SUCCESS || fd <= 0) {
+    Dbg(pi_dbg_ctl, "error getting the client socket fd from ssn");
+  }
+  if (getsockopt(fd, IPPROTO_TCP, TCP_CONNECTION_INFO, &info, &tcp_info_len) != 0) {
+    Dbg(pi_dbg_ctl, "getsockopt(%d, TCP_CONNECTION_INFO) failed: %s", fd, strerror(errno));
+  }
+
+  if (tsSsn == TS_SUCCESS) {
+    if (tcp_info_len > 0) {
+      char buf[12 * 4 + 9]; // 4x uint32's + 4x "; " + '\0'
+      snprintf(buf, sizeof(buf), "%" PRIu32 ";%" PRIu32 ";%" PRIu32 ";%" PRIu64 "", info.tcpi_rttcur, info.tcpi_rto,
+               info.tcpi_snd_cwnd, info.tcpi_txretransmitpackets);
       s += buf;
     }
   }

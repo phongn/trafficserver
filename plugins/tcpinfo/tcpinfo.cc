@@ -32,7 +32,7 @@
 // This is a bit of a hack, to get the more linux specific tcp_info struct ...
 #if HAVE_STRUCT_LINUX_TCP_INFO
 #include <linux/tcp.h>
-#elif HAVE_NETINET_IN_H
+#elif __has_include(<netinet/tcp.h>)
 #include <netinet/tcp.h>
 #endif
 #include <sys/types.h>
@@ -47,7 +47,7 @@
 
 #include "tscore/ParseRules.h"
 
-#if defined(TCP_INFO) && defined(HAVE_STRUCT_TCP_INFO)
+#if (defined(TCP_INFO) && defined(HAVE_STRUCT_TCP_INFO)) || defined(TCP_CONNECTION_INFO)
 #define TCPI_PLUGIN_SUPPORTED 1
 #endif
 
@@ -112,7 +112,11 @@ log_tcp_info(Config *config, const char *event_name, TSHttpSsn ssnp)
   const_sockaddr_ptr client_addr;
   const_sockaddr_ptr server_addr;
 
+#if defined(TCP_INFO)
   struct tcp_info info;
+#elif defined(TCP_CONNECTION_INFO)
+  struct tcp_connection_info info;
+#endif
   socklen_t tcp_info_len = sizeof(info);
   int fd;
 
@@ -127,8 +131,13 @@ log_tcp_info(Config *config, const char *event_name, TSHttpSsn ssnp)
     return;
   }
 
+#if defined(TCP_INFO)
   if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &tcp_info_len) != 0) {
     Dbg(dbg_ctl, "getsockopt(%d, TCP_INFO) failed: %s", fd, strerror(errno));
+#elif defined(TCP_CONNECTION_INFO)
+  if (getsockopt(fd, IPPROTO_TCP, TCP_CONNECTION_INFO, &info, &tcp_info_len) != 0) {
+    Dbg(dbg_ctl, "getsockopt(%d, TCP_CONNECTION_INFO) failed: %s", fd, strerror(errno));
+#endif
     return;
   }
 
@@ -146,26 +155,24 @@ log_tcp_info(Config *config, const char *event_name, TSHttpSsn ssnp)
   TSReturnCode ret;
 
   if (config->log_level == 2) {
-#if !defined(freebsd) || defined(__GLIBC__)
 #if HAVE_STRUCT_LINUX_TCP_INFO
     ret = TSTextLogObjectWrite(config->log, "%s %s %s %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u", event_name, client_str,
                                server_str, info.tcpi_rtt, info.tcpi_rttvar, info.tcpi_last_data_sent, info.tcpi_last_data_recv,
                                info.tcpi_snd_cwnd, info.tcpi_snd_ssthresh, info.tcpi_rcv_ssthresh, info.tcpi_unacked,
                                info.tcpi_sacked, info.tcpi_lost, info.tcpi_retrans, info.tcpi_fackets, info.tcpi_total_retrans,
                                info.tcpi_data_segs_in, info.tcpi_data_segs_out);
-#else
+#elif defined(freebsd)
     ret = TSTextLogObjectWrite(config->log, "%s %s %s %u %u %u %u %u %u %u %u %u %u %u %u %u", event_name, client_str, server_str,
                                info.tcpi_rtt, info.tcpi_rttvar, info.tcpi_last_data_sent, info.tcpi_last_data_recv,
                                info.tcpi_snd_cwnd, info.tcpi_snd_ssthresh, info.tcpi_rcv_ssthresh, info.tcpi_unacked,
                                info.tcpi_sacked, info.tcpi_lost, info.tcpi_retrans, info.tcpi_fackets, info.tcpi_total_retrans);
-#endif
-#else
-    // E.g. FreeBSD and macOS
-    ret = TSTextLogObjectWrite(config->log, "%s %s %s %u %u %u %u %u %u %u %u %u %u %u %u %u", event_name, client_str, server_str,
-                               info.tcpi_rtt, info.tcpi_rttvar, info.__tcpi_last_data_sent, info.tcpi_last_data_recv,
-                               info.tcpi_snd_cwnd, info.tcpi_snd_ssthresh, info.__tcpi_rcv_ssthresh, info.__tcpi_unacked,
-                               info.__tcpi_sacked, info.__tcpi_lost, info.__tcpi_retrans, info.__tcpi_fackets,
-                               info.tcpi_snd_rexmitpack);
+#elif defined(TCP_CONNECTION_INFO)
+  // E.g. FreeBSD and macOS
+  ret = TSTextLogObjectWrite(config->log, "%s %s %s %u %u %u %u %u %u %u %u %u %u %u %u %u", event_name, client_str, server_str,
+                             info.tcpi_rttcur, info.tcpi_rttvar, info.__tcpi_last_data_sent, info.tcpi_last_data_recv,
+                             info.tcpi_snd_cwnd, info.tcpi_snd_ssthresh, info.__tcpi_rcv_ssthresh, info.__tcpi_unacked,
+                             info.__tcpi_sacked, info.__tcpi_lost, info.tcpi_txretransmitpackets, info.__tcpi_fackets,
+                             info.tcpi_snd_rexmitpack);
 #endif
   } else {
     ret = TSTextLogObjectWrite(config->log, "%s %s %s %u", event_name, client_str, server_str, info.tcpi_rtt);

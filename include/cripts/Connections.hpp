@@ -247,6 +247,41 @@ class ConnBase
     struct tcp_info info;
     socklen_t info_len = sizeof(info);
 
+#elif defined(TCP_CONNECTION_INFO)
+    integer
+    rtt()
+    {
+      initialize();
+      return (_ready ? info.tcpi_rttcur : 0);
+    }
+
+    integer
+    rto()
+    {
+      initialize();
+      return (_ready ? info.tcpi_rto : 0);
+    }
+
+    integer
+    snd_cwnd()
+    {
+      initialize();
+      return (_ready ? info.tcpi_snd_cwnd : 0);
+    }
+
+    integer
+    retrans()
+    {
+      initialize();
+      // TODO: info.tcpi_txretransmitpackets is a u64 but this expects a u32
+      // return (_ready ? info.tcpi_txretransmitpackets : 0);
+      return 0
+      
+    }
+
+    struct tcp_connection_info info;
+    socklen_t info_len = sizeof(info);
+
 #else
     integer
     rtt()
