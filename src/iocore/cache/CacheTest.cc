@@ -31,6 +31,8 @@
 #include "tscore/Random.h"
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
+#include <chrono>
 #include <fstream>
 #include <sstream>
 
@@ -982,35 +984,209 @@ REGRESSION_TEST(ram_cache_trace)(RegressionTest *t, int level, int *pstatus)
   CacheKey  cachekey;
   StripeSM *stripe = theCache->key_to_stripe(&cachekey, "example.com"sv);
 
-  // Replay a captured trace if one is supplied, otherwise sweep generated traces. Each algorithm
-  // leaks its cache (there is no teardown), so keep cumulative resident memory under available RAM.
+  // TS_RAMCACHE_ALG selects a single algorithm (lru/clfus/wtinylfu); unset runs all three. Each
+  // algorithm leaks its cache (there is no teardown), so for very large caches set TS_RAMCACHE_ALG
+  // and TS_RAMCACHE_SIZE_MB and run one algorithm per invocation -- then only one cache is resident.
+  const char *alg     = getenv("TS_RAMCACHE_ALG");
+  auto        run_one = [&](const char *want, const char *disp, RamCache *(*mk)(), int64_t cache_size,
+                     const std::vector<RamTraceReq> &trace) {
+    if (alg && strcmp(alg, want) != 0) {
+      return;
+    }
+    double r = test_RamCache_trace(mk(), cache_size, stripe, trace);
+    rprintf(t, "RamCache trace %-8s size=%lld MB hit-rate %.3f\n", disp, (long long)(cache_size >> 20), r);
+  };
+
   if (char const *path = getenv("TS_RAMCACHE_TRACE")) {
     int64_t cache_size = 1LL << 30; // 1 GB default
     if (char const *sz = getenv("TS_RAMCACHE_SIZE_MB")) {
       cache_size = atoll(sz) << 20;
     }
     std::vector<RamTraceReq> trace = load_ram_trace(path);
-    double                   lru   = test_RamCache_trace(new_RamCacheLRU(), cache_size, stripe, trace);
-    double                   clfus = test_RamCache_trace(new_RamCacheCLFUS(), cache_size, stripe, trace);
-    double                   wtlfu = test_RamCache_trace(new_RamCacheWTinyLFU(), cache_size, stripe, trace);
-    rprintf(t, "RamCache trace[file reqs=%zu size=%lld MB]: LRU %.3f  CLFUS %.3f  WTinyLFU %.3f\n", trace.size(),
-            (long long)(cache_size >> 20), lru, clfus, wtlfu);
+    rprintf(t, "RamCache trace file reqs=%zu\n", trace.size());
+    run_one("lru", "LRU", new_RamCacheLRU, cache_size, trace);
+    run_one("clfus", "CLFUS", new_RamCacheCLFUS, cache_size, trace);
+    run_one("wtinylfu", "WTinyLFU", new_RamCacheWTinyLFU, cache_size, trace);
     *pstatus = REGRESSION_TEST_PASSED;
     return;
   }
 
-  int64_t const sizes[] = {64LL << 20, 1LL << 30}; // 64 MB, 1 GB
+  std::vector<int64_t> sizes;
+  if (char const *sz = getenv("TS_RAMCACHE_SIZE_MB")) {
+    sizes.push_back(atoll(sz) << 20);
+  } else {
+    sizes = {64LL << 20, 1LL << 30}; // 64 MB, 1 GB
+  }
   for (int64_t cache_size : sizes) {
     int64_t obj_est      = cache_size / (18 * 1024); // ~18 KB average object
     int64_t key_universe = obj_est * 4;              // working set ~4x the cache
     int64_t n_requests   = key_universe * 8;
 
     std::vector<RamTraceReq> trace = generate_ram_trace(key_universe, n_requests, 0.10); // 10% one-hit-wonders
-    double                   lru   = test_RamCache_trace(new_RamCacheLRU(), cache_size, stripe, trace);
-    double                   clfus = test_RamCache_trace(new_RamCacheCLFUS(), cache_size, stripe, trace);
-    double                   wtlfu = test_RamCache_trace(new_RamCacheWTinyLFU(), cache_size, stripe, trace);
-    rprintf(t, "RamCache trace[size=%lld MB universe=%lld reqs=%lld 10%% one-hit]: LRU %.3f  CLFUS %.3f  WTinyLFU %.3f\n",
-            (long long)(cache_size >> 20), (long long)key_universe, (long long)n_requests, lru, clfus, wtlfu);
+    rprintf(t, "RamCache trace size=%lld MB universe=%lld reqs=%lld 10%%-one-hit\n", (long long)(cache_size >> 20),
+            (long long)key_universe, (long long)n_requests);
+    run_one("lru", "LRU", new_RamCacheLRU, cache_size, trace);
+    run_one("clfus", "CLFUS", new_RamCacheCLFUS, cache_size, trace);
+    run_one("wtinylfu", "WTinyLFU", new_RamCacheWTinyLFU, cache_size, trace);
   }
+  *pstatus = REGRESSION_TEST_PASSED; // informational comparison
+}
+
+// ---- Scan resistance --------------------------------------------------------
+//
+// A small hot set is kept hot while a long stream of unique, one-time keys (a scan) flows past.
+// A scan-resistant policy keeps the hot set resident instead of letting the scan evict it; this
+// reports the hot set's hit rate over the second half. W-TinyLFU resists scans via TinyLFU
+// admission; LRU and CLFUS via the seen filter.
+static double
+test_RamCache_scan(RamCache *cache, int64_t cache_size, StripeSM *stripe)
+{
+  cache->init(cache_size, stripe);
+
+  int const cap            = static_cast<int>(cache_size / BUFFER_SIZE_FOR_INDEX(BUFFER_SIZE_INDEX_16K));
+  int const nhot           = cap / 2; // hot set fits with room to spare
+  int const rounds         = 30;
+  int const scan_per_round = cap; // heavy scan pressure each round
+  uint64_t  scan_key       = 10000000;
+
+  std::vector<Ptr<IOBufferData>> keep;
+  auto                           access = [&](uint64_t k) -> bool {
+    CryptoHash hash;
+    hash.u64[0] = (k << 32) | (k & 0xffffffffu);
+    hash.u64[1] = hash.u64[0];
+    Ptr<IOBufferData> got;
+    if (cache->get(&hash, &got)) {
+      return true;
+    }
+    IOBufferData *d = THREAD_ALLOC(ioDataAllocator, this_thread());
+    d->alloc(BUFFER_SIZE_INDEX_16K);
+    memset(d->data(), 0, d->block_size());
+    keep.push_back(make_ptr(d));
+    cache->put(&hash, d, d->block_size());
+    return false;
+  };
+
+  int hits = 0, total = 0;
+  for (int r = 0; r < rounds; r++) {
+    for (int i = 0; i < nhot; i++) {
+      bool hit = access(1 + i); // hot keys [1, nhot]
+      if (r >= rounds / 2) {
+        total++;
+        hits += hit ? 1 : 0;
+      }
+    }
+    for (int s = 0; s < scan_per_round; s++) {
+      access(scan_key++); // unique one-time keys
+    }
+    keep.clear();
+  }
+  return total ? static_cast<double>(hits) / total : 0.0;
+}
+
+REGRESSION_TEST(ram_cache_scan)(RegressionTest *t, int level, int *pstatus)
+{
+  if (REGRESSION_TEST_NIGHTLY > level) {
+    *pstatus = REGRESSION_TEST_PASSED;
+    return;
+  }
+  if (cacheProcessor.IsCacheEnabled() != CacheInitState::INITIALIZED) {
+    rprintf(t, "cache not initialized");
+    *pstatus = REGRESSION_TEST_FAILED;
+    return;
+  }
+
+  CacheKey  key;
+  StripeSM *stripe     = theCache->key_to_stripe(&key, "example.com"sv);
+  int64_t   cache_size = 1LL << 23; // 8 MB
+
+  double lru   = test_RamCache_scan(new_RamCacheLRU(), cache_size, stripe);
+  double clfus = test_RamCache_scan(new_RamCacheCLFUS(), cache_size, stripe);
+  double wtlfu = test_RamCache_scan(new_RamCacheWTinyLFU(), cache_size, stripe);
+
+  rprintf(t, "RamCache scan resistance: hot-set hit rate under heavy one-time scan (higher is better)\n");
+  rprintf(t, "RamCache LRU      scan-hot-hit-rate %.3f\n", lru);
+  rprintf(t, "RamCache CLFUS    scan-hot-hit-rate %.3f\n", clfus);
+  rprintf(t, "RamCache WTinyLFU scan-hot-hit-rate %.3f\n", wtlfu);
+
+  *pstatus = REGRESSION_TEST_PASSED; // informational comparison
+}
+
+// ---- Throughput -------------------------------------------------------------
+//
+// Reports nanoseconds per get (all hits) and per put (all misses/inserts) on a filled cache, to
+// compare the per-operation cost of each policy (e.g. W-TinyLFU's sketch update on every get).
+static void
+test_RamCache_throughput(RegressionTest *t, RamCache *cache, const char *name, int64_t cache_size, StripeSM *stripe)
+{
+  cache->init(cache_size, stripe);
+  int const cap = static_cast<int>(cache_size / BUFFER_SIZE_FOR_INDEX(BUFFER_SIZE_INDEX_16K));
+
+  std::vector<Ptr<IOBufferData>> keep;
+  auto                           make_key = [](uint64_t k) {
+    CryptoHash hash;
+    hash.u64[0] = (k << 32) | (k & 0xffffffffu);
+    hash.u64[1] = hash.u64[0];
+    return hash;
+  };
+  auto put_k = [&](uint64_t k) {
+    CryptoHash    hash = make_key(k);
+    IOBufferData *d    = THREAD_ALLOC(ioDataAllocator, this_thread());
+    d->alloc(BUFFER_SIZE_INDEX_16K);
+    memset(d->data(), 0, d->block_size());
+    keep.push_back(make_ptr(d));
+    cache->put(&hash, d, d->block_size());
+  };
+
+  for (int i = 0; i < cap; i++) { // fill so gets are hits
+    put_k(static_cast<uint64_t>(i));
+  }
+  keep.clear();
+
+  constexpr int N = 2000000;
+  using clk       = std::chrono::steady_clock;
+
+  uint64_t acc = 0;
+  auto     g0  = clk::now();
+  for (int i = 0; i < N; i++) {
+    CryptoHash        hash = make_key(static_cast<uint64_t>(i % cap));
+    Ptr<IOBufferData> got;
+    acc += cache->get(&hash, &got);
+  }
+  double get_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - g0).count() / static_cast<double>(N);
+
+  uint64_t pk = 100000000;
+  auto     p0 = clk::now();
+  for (int i = 0; i < N; i++) {
+    put_k(pk++);
+    if ((i & 0xfff) == 0xfff) {
+      keep.clear();
+    }
+  }
+  double put_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - p0).count() / static_cast<double>(N);
+
+  keep.clear();
+  rprintf(t, "RamCache throughput %-8s get %.1f ns/op  put %.1f ns/op  (checksum %" PRIu64 ")\n", name, get_ns, put_ns, acc);
+}
+
+REGRESSION_TEST(ram_cache_throughput)(RegressionTest *t, int level, int *pstatus)
+{
+  if (REGRESSION_TEST_NIGHTLY > level) {
+    *pstatus = REGRESSION_TEST_PASSED;
+    return;
+  }
+  if (cacheProcessor.IsCacheEnabled() != CacheInitState::INITIALIZED) {
+    rprintf(t, "cache not initialized");
+    *pstatus = REGRESSION_TEST_FAILED;
+    return;
+  }
+
+  CacheKey  key;
+  StripeSM *stripe     = theCache->key_to_stripe(&key, "example.com"sv);
+  int64_t   cache_size = 1LL << 28; // 256 MB
+
+  test_RamCache_throughput(t, new_RamCacheLRU(), "LRU", cache_size, stripe);
+  test_RamCache_throughput(t, new_RamCacheCLFUS(), "CLFUS", cache_size, stripe);
+  test_RamCache_throughput(t, new_RamCacheWTinyLFU(), "WTinyLFU", cache_size, stripe);
+
   *pstatus = REGRESSION_TEST_PASSED; // informational comparison
 }

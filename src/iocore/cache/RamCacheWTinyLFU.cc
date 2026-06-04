@@ -40,14 +40,28 @@
 #include "tscore/CryptoHash.h"
 #include "tscore/List.h"
 #include <vector>
+#include <cstdlib>
 
 #define ENTRY_OVERHEAD      128   // per-entry overhead counted against ram_cache.size
 #define WINDOW_PERCENT      1     // window cache is this percent of total capacity
 #define PROTECTED_PERCENT   80    // protected segment is this percent of the main cache
 #define CMS_DEPTH           4     // number of Count-Min Sketch counters consulted per key
 #define AVG_OBJECT_ESTIMATE 16384 // assumed average object size for capacity/reset estimates
-#define CMS_SAMPLE_FACTOR   10    // halve the sketch after ~ capacity * this many accesses (TinyLFU aging)
-#define CMS_MAX             15    // 4-bit saturating counters
+// CMS_SAMPLE_FACTOR: halve the sketch once it has recorded ~ capacity * this many accesses
+// (TinyLFU aging). Caffeine uses 10; 2 tracks non-stationary (drifting) workloads far better on
+// the synthetic suite with no stationary-Zipfian loss. Tunable via TS_WTLFU_SAMPLE_FACTOR; the
+// best value is workload-dependent.
+#define CMS_SAMPLE_FACTOR 2
+#define CMS_MAX           15 // 4-bit saturating counters
+
+// Experimental tuning hooks: the policy parameters can be overridden from the environment so a
+// sweep can be run without recompiling. Unset in production, so the #define defaults apply.
+static int
+wtlfu_env_int(const char *name, int dflt)
+{
+  const char *v = getenv(name);
+  return v ? atoi(v) : dflt;
+}
 
 enum { SEG_WINDOW = 0, SEG_PROBATION = 1, SEG_PROTECTED = 2 };
 
@@ -135,9 +149,11 @@ RamCacheWTinyLFU::init(int64_t abytes, StripeSM *astripe)
   if (!_max_bytes) {
     return;
   }
-  _window_limit    = _max_bytes * WINDOW_PERCENT / 100;
-  int64_t main     = _max_bytes - _window_limit;
-  _protected_limit = main * PROTECTED_PERCENT / 100;
+  int window_pct    = wtlfu_env_int("TS_WTLFU_WINDOW_PCT", WINDOW_PERCENT);
+  int protected_pct = wtlfu_env_int("TS_WTLFU_PROTECTED_PCT", PROTECTED_PERCENT);
+  _window_limit     = _max_bytes * window_pct / 100;
+  int64_t main      = _max_bytes - _window_limit;
+  _protected_limit  = main * protected_pct / 100;
   _resize_hashtable();
 
   // Size the frequency sketch to roughly the entry capacity (rounded up to a power of two), and
@@ -156,7 +172,7 @@ RamCacheWTinyLFU::init(int64_t abytes, StripeSM *astripe)
   _freq.assign(width * CMS_DEPTH, 0);
   _freq_mask   = width - 1;
   _freq_sample = 0;
-  _freq_reset  = est_objects * CMS_SAMPLE_FACTOR;
+  _freq_reset  = est_objects * wtlfu_env_int("TS_WTLFU_SAMPLE_FACTOR", CMS_SAMPLE_FACTOR);
 }
 
 uint64_t
