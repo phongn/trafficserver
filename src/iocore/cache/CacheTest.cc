@@ -918,9 +918,33 @@ static std::vector<RamTraceReq>
 load_ram_trace(const char *path)
 {
   std::vector<RamTraceReq> trace;
-  std::ifstream            in(path);
-  std::string              line;
-  while (std::getline(in, line)) {
+  // Cap requests so very large production traces fit in memory (override with TS_RAMCACHE_MAXREQS).
+  const char *cap_env  = getenv("TS_RAMCACHE_MAXREQS");
+  int64_t     max_reqs = cap_env ? atoll(cap_env) : 40000000;
+  size_t      n        = strlen(path);
+
+  if (n >= 4 && strcmp(path + n - 4, ".bin") == 0) {
+    // libCacheSim "oracleGeneral" format: packed 24-byte little-endian records
+    //   { uint32 time; uint64 obj_id; uint32 obj_size; int64 next_access }.
+    std::ifstream in(path, std::ios::binary);
+    char          rec[24];
+    while (static_cast<int64_t>(trace.size()) < max_reqs && in.read(rec, sizeof(rec))) {
+      uint64_t obj_id;
+      uint32_t obj_size;
+      memcpy(&obj_id, rec + 4, 8);
+      memcpy(&obj_size, rec + 12, 4);
+      int64_t bytes = obj_size ? obj_size : 1;
+      if (bytes > (1 << 20)) {
+        bytes = 1 << 20; // clamp huge objects so the allocator stays bounded
+      }
+      trace.push_back({obj_id, static_cast<int>(iobuffer_size_to_index(bytes, MAX_BUFFER_SIZE_INDEX))});
+    }
+    return trace;
+  }
+
+  std::ifstream in(path);
+  std::string   line;
+  while (static_cast<int64_t>(trace.size()) < max_reqs && std::getline(in, line)) {
     if (line.empty() || line[0] == '#') {
       continue;
     }
@@ -946,8 +970,8 @@ test_RamCache_trace(RamCache *cache, int64_t cache_size, StripeSM *stripe, const
   for (size_t i = 0; i < trace.size(); i++) {
     uint64_t   k = trace[i].key;
     CryptoHash hash;
-    hash.u64[0] = (k << 32) | (k & 0xffffffffu);
-    hash.u64[1] = hash.u64[0];
+    hash.u64[0] = k; // preserve the full 64-bit object id (real traces use the whole range)
+    hash.u64[1] = k * 0x9e3779b97f4a7c15ull;
     Ptr<IOBufferData> got;
     bool              hit = cache->get(&hash, &got);
     if (i >= measure_from) {
@@ -956,8 +980,7 @@ test_RamCache_trace(RamCache *cache, int64_t cache_size, StripeSM *stripe, const
     }
     if (!hit) {
       IOBufferData *d = THREAD_ALLOC(ioDataAllocator, this_thread());
-      d->alloc(trace[i].size_index);
-      memset(d->data(), 0, d->block_size());
+      d->alloc(trace[i].size_index); // content is never read (compression off), so skip memset
       keep.push_back(make_ptr(d));
       cache->put(&hash, d, d->block_size());
     }
