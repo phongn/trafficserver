@@ -684,6 +684,7 @@ REGRESSION_TEST(ram_cache)(RegressionTest *t, int level, int *pstatus)
     if (!test_RamCache(t, new_RamCacheLRU(), "LRU", cache_size) || !test_RamCache(t, new_RamCacheCLFUS(), "CLFUS", cache_size)) {
       *pstatus = REGRESSION_TEST_FAILED;
     }
+    test_RamCache(t, new_RamCacheWTinyLFU(), "WTinyLFU", cache_size); // experimental, informational
   }
 }
 
@@ -782,10 +783,12 @@ REGRESSION_TEST(ram_cache_adaptivity)(RegressionTest *t, int level, int *pstatus
 
   RamCacheAdaptResult lru   = test_RamCache_adaptivity(new_RamCacheLRU(), cache_size, stripe);
   RamCacheAdaptResult clfus = test_RamCache_adaptivity(new_RamCacheCLFUS(), cache_size, stripe);
+  RamCacheAdaptResult wtlfu = test_RamCache_adaptivity(new_RamCacheWTinyLFU(), cache_size, stripe);
 
   rprintf(t, "RamCache adaptivity after working-set shift (higher B-hit-rate / lower A-retained is better)\n");
-  rprintf(t, "RamCache LRU   B-hit-rate %.3f  A-retained %d/%d\n", lru.b_hit_rate, lru.a_retained, lru.a_total);
-  rprintf(t, "RamCache CLFUS B-hit-rate %.3f  A-retained %d/%d\n", clfus.b_hit_rate, clfus.a_retained, clfus.a_total);
+  rprintf(t, "RamCache LRU      B-hit-rate %.3f  A-retained %d/%d\n", lru.b_hit_rate, lru.a_retained, lru.a_total);
+  rprintf(t, "RamCache CLFUS    B-hit-rate %.3f  A-retained %d/%d\n", clfus.b_hit_rate, clfus.a_retained, clfus.a_total);
+  rprintf(t, "RamCache WTinyLFU B-hit-rate %.3f  A-retained %d/%d\n", wtlfu.b_hit_rate, wtlfu.a_retained, wtlfu.a_total);
 
   // With the F2 fixes CLFUS must follow the shift: serve the new working set and release the stale one.
   *pstatus = (clfus.b_hit_rate >= 0.90 && clfus.a_retained <= clfus.a_total / 3) ? REGRESSION_TEST_PASSED : REGRESSION_TEST_FAILED;
@@ -859,10 +862,12 @@ REGRESSION_TEST(ram_cache_drift)(RegressionTest *t, int level, int *pstatus)
 
   double lru   = test_RamCache_drift(new_RamCacheLRU(), cache_size, stripe);
   double clfus = test_RamCache_drift(new_RamCacheCLFUS(), cache_size, stripe);
+  double wtlfu = test_RamCache_drift(new_RamCacheWTinyLFU(), cache_size, stripe);
 
   rprintf(t, "RamCache gradual-drift current-window hit rate (higher is better)\n");
-  rprintf(t, "RamCache LRU   drift-hit-rate %.3f\n", lru);
-  rprintf(t, "RamCache CLFUS drift-hit-rate %.3f\n", clfus);
+  rprintf(t, "RamCache LRU      drift-hit-rate %.3f\n", lru);
+  rprintf(t, "RamCache CLFUS    drift-hit-rate %.3f\n", clfus);
+  rprintf(t, "RamCache WTinyLFU drift-hit-rate %.3f\n", wtlfu);
 
   // With the F2 fixes CLFUS must track a rolling working set, not freeze on the initial cohort.
   *pstatus = (clfus >= 0.80) ? REGRESSION_TEST_PASSED : REGRESSION_TEST_FAILED;
@@ -987,8 +992,9 @@ REGRESSION_TEST(ram_cache_trace)(RegressionTest *t, int level, int *pstatus)
     std::vector<RamTraceReq> trace = load_ram_trace(path);
     double                   lru   = test_RamCache_trace(new_RamCacheLRU(), cache_size, stripe, trace);
     double                   clfus = test_RamCache_trace(new_RamCacheCLFUS(), cache_size, stripe, trace);
-    rprintf(t, "RamCache trace[file reqs=%zu size=%lld MB]: LRU %.3f  CLFUS %.3f\n", trace.size(), (long long)(cache_size >> 20),
-            lru, clfus);
+    double                   wtlfu = test_RamCache_trace(new_RamCacheWTinyLFU(), cache_size, stripe, trace);
+    rprintf(t, "RamCache trace[file reqs=%zu size=%lld MB]: LRU %.3f  CLFUS %.3f  WTinyLFU %.3f\n", trace.size(),
+            (long long)(cache_size >> 20), lru, clfus, wtlfu);
     *pstatus = REGRESSION_TEST_PASSED;
     return;
   }
@@ -1002,8 +1008,9 @@ REGRESSION_TEST(ram_cache_trace)(RegressionTest *t, int level, int *pstatus)
     std::vector<RamTraceReq> trace = generate_ram_trace(key_universe, n_requests, 0.10); // 10% one-hit-wonders
     double                   lru   = test_RamCache_trace(new_RamCacheLRU(), cache_size, stripe, trace);
     double                   clfus = test_RamCache_trace(new_RamCacheCLFUS(), cache_size, stripe, trace);
-    rprintf(t, "RamCache trace[size=%lld MB universe=%lld reqs=%lld 10%% one-hit]: LRU %.3f  CLFUS %.3f\n",
-            (long long)(cache_size >> 20), (long long)key_universe, (long long)n_requests, lru, clfus);
+    double                   wtlfu = test_RamCache_trace(new_RamCacheWTinyLFU(), cache_size, stripe, trace);
+    rprintf(t, "RamCache trace[size=%lld MB universe=%lld reqs=%lld 10%% one-hit]: LRU %.3f  CLFUS %.3f  WTinyLFU %.3f\n",
+            (long long)(cache_size >> 20), (long long)key_universe, (long long)n_requests, lru, clfus, wtlfu);
   }
   *pstatus = REGRESSION_TEST_PASSED; // informational comparison
 }
