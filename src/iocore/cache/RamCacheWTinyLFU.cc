@@ -53,6 +53,10 @@
 // best value is workload-dependent.
 #define CMS_SAMPLE_FACTOR 2
 #define CMS_MAX           15 // 4-bit saturating counters
+// Adaptive-window hill climber: step the window by this percent of capacity each adaptation
+// period. The step must be large enough that the per-step hit-rate change stays above the
+// sampling noise of one period; a 1% step stalls near the optimum on recency-heavy traces.
+#define ADAPT_STEP_PERCENT 5
 
 // Experimental tuning hooks: the policy parameters can be overridden from the environment so a
 // sweep can be run without recompiling. Unset in production, so the #define defaults apply.
@@ -90,6 +94,18 @@ private:
   int64_t _protected_limit = 0;
   int64_t _seg_bytes[3]    = {0, 0, 0};
 
+  // Adaptive window (Caffeine-style hill climbing): the window/main split is nudged toward the
+  // better recent hit rate. Disabled when the window is pinned via TS_WTLFU_WINDOW_PCT.
+  int     _protected_pct  = PROTECTED_PERCENT;
+  bool    _adapt          = true;
+  int64_t _window_lo      = 0;
+  int64_t _window_hi      = 0;
+  int64_t _window_step    = 0;
+  int64_t _adapt_interval = 0;
+  int64_t _adapt_clock    = 0;
+  int64_t _adapt_hits     = 0;
+  double  _prev_hitrate   = -1.0;
+
   Que(RamCacheWTinyLFUEntry, lru_link) _seg[3];
   DList(RamCacheWTinyLFUEntry, hash_link) *_bucket = nullptr;
   int _nbuckets                                    = 0;
@@ -113,6 +129,7 @@ private:
   uint64_t _khash(const CryptoHash *key) const;
   uint32_t _freq_estimate(uint64_t h) const;
   void     _freq_record(uint64_t h);
+  void     _adapt_window(bool hit);
 };
 
 ClassAllocator<RamCacheWTinyLFUEntry, false> ramCacheWTinyLFUEntryAllocator("RamCacheWTinyLFUEntry");
@@ -149,11 +166,17 @@ RamCacheWTinyLFU::init(int64_t abytes, StripeSM *astripe)
   if (!_max_bytes) {
     return;
   }
-  int window_pct    = wtlfu_env_int("TS_WTLFU_WINDOW_PCT", WINDOW_PERCENT);
-  int protected_pct = wtlfu_env_int("TS_WTLFU_PROTECTED_PCT", PROTECTED_PERCENT);
-  _window_limit     = _max_bytes * window_pct / 100;
-  int64_t main      = _max_bytes - _window_limit;
-  _protected_limit  = main * protected_pct / 100;
+  const char *window_env = getenv("TS_WTLFU_WINDOW_PCT");
+  int         window_pct = window_env ? atoi(window_env) : WINDOW_PERCENT;
+  _protected_pct         = wtlfu_env_int("TS_WTLFU_PROTECTED_PCT", PROTECTED_PERCENT);
+  _window_limit          = _max_bytes * window_pct / 100;
+  _protected_limit       = (_max_bytes - _window_limit) * _protected_pct / 100;
+  // Hill-climb the window between 1% and 80% of the cache (see _adapt_window), unless it was
+  // pinned via TS_WTLFU_WINDOW_PCT (which is for experiments / sweeps).
+  _adapt       = (window_env == nullptr) && wtlfu_env_int("TS_WTLFU_ADAPT", 1) != 0;
+  _window_lo   = _max_bytes / 100;
+  _window_hi   = _max_bytes * 80 / 100;
+  _window_step = _max_bytes * ADAPT_STEP_PERCENT / 100;
   _resize_hashtable();
 
   // Size the frequency sketch to roughly the entry capacity (rounded up to a power of two), and
@@ -173,6 +196,11 @@ RamCacheWTinyLFU::init(int64_t abytes, StripeSM *astripe)
   _freq_mask   = width - 1;
   _freq_sample = 0;
   _freq_reset  = est_objects * wtlfu_env_int("TS_WTLFU_SAMPLE_FACTOR", CMS_SAMPLE_FACTOR);
+
+  _adapt_interval = est_objects * 10; // re-evaluate the window roughly every 10 cache turnovers
+  if (_adapt_interval < 10000) {
+    _adapt_interval = 10000;
+  }
 }
 
 uint64_t
@@ -312,11 +340,48 @@ RamCacheWTinyLFU::get(CryptoHash *key, Ptr<IOBufferData> *ret_data, uint64_t aux
     (*ret_data) = e->data;
     ts::Metrics::Counter::increment(cache_rsb.ram_cache_hits);
     ts::Metrics::Counter::increment(_stripe->cache_vol->vol_rsb.ram_cache_hits);
-    return 1;
+  } else {
+    ts::Metrics::Counter::increment(cache_rsb.ram_cache_misses);
+    ts::Metrics::Counter::increment(_stripe->cache_vol->vol_rsb.ram_cache_misses);
   }
-  ts::Metrics::Counter::increment(cache_rsb.ram_cache_misses);
-  ts::Metrics::Counter::increment(_stripe->cache_vol->vol_rsb.ram_cache_misses);
-  return 0;
+  if (_adapt) {
+    _adapt_window(e != nullptr);
+  }
+  return e != nullptr ? 1 : 0;
+}
+
+// Hill-climb the window/main split toward the better recent hit rate: each adaptation period,
+// nudge the window by one step; if the hit rate fell versus the previous period, reverse the
+// step direction. This lets W-TinyLFU find the recency/frequency balance a fixed window cannot.
+void
+RamCacheWTinyLFU::_adapt_window(bool hit)
+{
+  _adapt_hits += hit ? 1 : 0;
+  if (++_adapt_clock < _adapt_interval) {
+    return;
+  }
+  double hr = static_cast<double>(_adapt_hits) / static_cast<double>(_adapt_clock);
+  // Reverse direction only on a real decline (beyond per-period sampling noise); otherwise keep
+  // stepping the same way. The step magnitude is held constant rather than decayed: a fixed step
+  // keeps the window probing on both sides of the current optimum, which tracks a shifting
+  // (non-stationary) working set -- the realistic case -- far better than converging to a point.
+  // The hysteresis keeps noise near a flat optimum from thrashing the direction.
+  if (_prev_hitrate >= 0.0 && hr < _prev_hitrate - 0.002) {
+    _window_step = -_window_step; // the last move hurt; go the other way
+  }
+  int64_t nw = _window_limit + _window_step;
+  if (nw < _window_lo) {
+    nw           = _window_lo;
+    _window_step = -_window_step;
+  } else if (nw > _window_hi) {
+    nw           = _window_hi;
+    _window_step = -_window_step;
+  }
+  _window_limit    = nw;
+  _protected_limit = (_max_bytes - _window_limit) * _protected_pct / 100;
+  _prev_hitrate    = hr;
+  _adapt_hits      = 0;
+  _adapt_clock     = 0;
 }
 
 int
