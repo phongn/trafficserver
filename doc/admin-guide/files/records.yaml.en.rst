@@ -2892,10 +2892,27 @@ RAM Cache
 
 .. ts:cv:: CONFIG proxy.config.cache.ram_cache.algorithm INT 1
 
-   Two distinct RAM caches are supported, the default (1) being the simpler
-   **LRU** (*Least Recently Used*) cache. As an alternative, the **CLFUS**
-   (*Clocked Least Frequently Used by Size*) is also available, by changing this
-   configuration to 0.
+   Three RAM cache eviction algorithms are supported, selected by this value:
+
+   ``1``
+       **LRU** (*Least Recently Used*), the default -- the simplest policy,
+       favoring recency. Pairs with
+       :ts:cv:`proxy.config.cache.ram_cache.use_seen_filter` for scan
+       resistance.
+
+   ``0``
+       **CLFUS** (*Clocked Least Frequently Used by Size*), which balances
+       recency, frequency, and object size. It is the only algorithm that
+       supports in-RAM compression
+       (:ts:cv:`proxy.config.cache.ram_cache.compress`).
+
+   ``2``
+       **W-TinyLFU** (*Window TinyLFU*, the policy used by Caffeine): a small
+       recency **window** in front of a frequency-filtered main cache, with
+       admission gated by an aged frequency sketch. The window/main split is
+       adaptive, so it tracks recency-heavy and frequency-heavy workloads
+       without tuning. It is scan-resistant by design and does not use the
+       seen filter. It does not support in-RAM compression.
 
 .. ts:cv:: CONFIG proxy.config.cache.ram_cache.use_seen_filter INT 1
 
