@@ -21,7 +21,15 @@
   limitations under the License.
  */
 
-// Window-TinyLFU (W-TinyLFU) replacement policy, as used by Caffeine.
+// Window-TinyLFU (W-TinyLFU) RAM cache replacement policy.
+//
+// The design follows two references:
+//   * G. Einziger, R. Friedman, B. Manes, "TinyLFU: A Highly Efficient Cache Admission
+//     Policy", ACM Trans. Storage 13(4), 2017 (arXiv:1512.00727) -- the frequency-sketch
+//     admission filter with periodic aging.
+//   * Caffeine (https://github.com/ben-manes/caffeine, Apache-2.0) -- the window plus
+//     segmented-LRU structure, the sketch's increment-then-halve aging, and the adaptive
+//     window.
 //
 // EXPERIMENTAL: a small "window" LRU in front of a main SLRU (probation +
 // protected), with admission to the main cache gated by a TinyLFU frequency
