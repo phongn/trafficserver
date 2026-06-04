@@ -35,6 +35,9 @@
 #include <chrono>
 #include <fstream>
 #include <sstream>
+#include <cstdio>
+#include <string>
+#include <sys/stat.h>
 
 using namespace std::literals;
 
@@ -914,50 +917,131 @@ generate_ram_trace(int64_t key_universe, int64_t n_requests, double one_hit_frac
   return trace;
 }
 
-static std::vector<RamTraceReq>
-load_ram_trace(const char *path)
+// ---- Streaming trace source -------------------------------------------------
+//
+// Reads a request trace sequentially without ever holding it in memory, so a trace far larger
+// than RAM can be replayed (production traces run to billions of records). Supported inputs:
+//   - libCacheSim "oracleGeneral" binary: packed 24-byte little-endian records
+//       { uint32 time; uint64 obj_id; uint32 obj_size; int64 next_access }   (".bin")
+//   - libCacheSim CSV export "time, object, size, next_access_vtime" with a '#' header (".csv")
+//   - whitespace text "<decimal-key> [size-bytes]" per line (any other extension)
+// Any of these may be zstd-compressed (".zst"), streamed through `zstd -dc`. This is test-only
+// code reading a developer-supplied path, hence the popen.
+static bool
+has_suffix(const std::string &s, const char *suffix)
 {
-  std::vector<RamTraceReq> trace;
-  // Cap requests so very large production traces fit in memory (override with TS_RAMCACHE_MAXREQS).
-  const char *cap_env  = getenv("TS_RAMCACHE_MAXREQS");
-  int64_t     max_reqs = cap_env ? atoll(cap_env) : 40000000;
-  size_t      n        = strlen(path);
+  size_t n = strlen(suffix);
+  return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
+}
 
-  if (n >= 4 && strcmp(path + n - 4, ".bin") == 0) {
-    // libCacheSim "oracleGeneral" format: packed 24-byte little-endian records
-    //   { uint32 time; uint64 obj_id; uint32 obj_size; int64 next_access }.
-    std::ifstream in(path, std::ios::binary);
-    char          rec[24];
-    while (static_cast<int64_t>(trace.size()) < max_reqs && in.read(rec, sizeof(rec))) {
+namespace
+{
+struct TraceSource {
+  FILE       *_f      = nullptr;
+  bool        _pipe   = false; // decompressing through zstd
+  bool        _binary = false; // 24-byte oracleGeneral records
+  bool        _csv    = false; // comma-separated, key is the 2nd field
+  std::string _path;
+
+  explicit TraceSource(const char *path) : _path(path)
+  {
+    std::string inner = _path;
+    if (has_suffix(inner, ".zst")) {
+      _pipe = true;
+      inner.resize(inner.size() - 4);
+    }
+    // libCacheSim oracleGeneral binaries are named ".oracleGeneral" or ".oracleGeneral.bin".
+    _binary = has_suffix(inner, ".bin") || has_suffix(inner, ".oracleGeneral");
+    _csv    = has_suffix(inner, ".csv");
+    _open();
+  }
+  ~TraceSource() { _close(); }
+  TraceSource(const TraceSource &)            = delete;
+  TraceSource &operator=(const TraceSource &) = delete;
+
+  void
+  _open()
+  {
+    if (_pipe) {
+      // zstd -dc streams the decompressed bytes; quote the path (test-only, trusted input) and
+      // refuse a path containing a quote rather than build an unsafe command.
+      std::string cmd = "zstd -dcq '" + _path + "'";
+      _f              = _path.find('\'') == std::string::npos ? popen(cmd.c_str(), "r") : nullptr;
+    } else {
+      _f = fopen(_path.c_str(), _binary ? "rb" : "r");
+    }
+  }
+  void
+  _close()
+  {
+    if (_f) {
+      _pipe ? pclose(_f) : fclose(_f);
+      _f = nullptr;
+    }
+  }
+
+  // Yields the next record's key and object size in bytes; false at end of stream.
+  bool
+  next(uint64_t &key, int64_t &size_bytes)
+  {
+    if (!_f) {
+      return false;
+    }
+    if (_binary) {
+      unsigned char rec[24];
+      if (fread(rec, 1, sizeof(rec), _f) != sizeof(rec)) {
+        return false;
+      }
       uint64_t obj_id;
       uint32_t obj_size;
       memcpy(&obj_id, rec + 4, 8);
       memcpy(&obj_size, rec + 12, 4);
-      int64_t bytes = obj_size ? obj_size : 1;
-      if (bytes > (1 << 20)) {
-        bytes = 1 << 20; // clamp huge objects so the allocator stays bounded
+      key        = obj_id;
+      size_bytes = obj_size ? obj_size : 1;
+      return true;
+    }
+    char line[512];
+    while (fgets(line, sizeof(line), _f)) {
+      if (line[0] == '#' || line[0] == '\n' || line[0] == '\0') {
+        continue;
       }
-      trace.push_back({obj_id, static_cast<int>(iobuffer_size_to_index(bytes, MAX_BUFFER_SIZE_INDEX))});
+      unsigned long long k  = 0;
+      long long          sz = 0;
+      // CSV "time, object, size, ...": key is field 2. Text "<key> [size]": key is field 1.
+      int got = _csv ? sscanf(line, " %*[^,], %llu , %lld", &k, &sz) : sscanf(line, " %llu %lld", &k, &sz);
+      if (got >= 1) {
+        key        = k;
+        size_bytes = sz > 0 ? sz : 1;
+        return true;
+      }
     }
-    return trace;
+    return false;
   }
+};
+} // namespace
 
-  std::ifstream in(path);
-  std::string   line;
-  while (static_cast<int64_t>(trace.size()) < max_reqs && std::getline(in, line)) {
-    if (line.empty() || line[0] == '#') {
-      continue;
+// Counts the records in a trace (capped at max_reqs) to locate the warmup midpoint. For an
+// uncompressed oracleGeneral ".bin" this is the file size / 24; otherwise it takes one streaming
+// pass (cheap next to the replay, which does cache work per record).
+static int64_t
+ram_trace_count(const char *path, int64_t max_reqs)
+{
+  std::string p = path;
+  // An uncompressed oracleGeneral binary is seekable: count = size / 24, no scan needed.
+  if (!has_suffix(p, ".zst") && (has_suffix(p, ".bin") || has_suffix(p, ".oracleGeneral"))) {
+    struct stat st;
+    if (stat(path, &st) == 0) {
+      int64_t recs = st.st_size / 24;
+      return recs < max_reqs ? recs : max_reqs;
     }
-    std::istringstream ls(line);
-    uint64_t           key;
-    if (!(ls >> key)) {
-      continue;
-    }
-    int64_t bytes  = 0;
-    int size_index = (ls >> bytes) ? static_cast<int>(iobuffer_size_to_index(bytes, MAX_BUFFER_SIZE_INDEX)) : BUFFER_SIZE_INDEX_16K;
-    trace.push_back({key, size_index});
   }
-  return trace;
+  TraceSource src(path);
+  uint64_t    key;
+  int64_t     sz, count = 0;
+  while (count < max_reqs && src.next(key, sz)) {
+    count++;
+  }
+  return count;
 }
 
 static double
@@ -981,6 +1065,48 @@ test_RamCache_trace(RamCache *cache, int64_t cache_size, StripeSM *stripe, const
     if (!hit) {
       IOBufferData *d = THREAD_ALLOC(ioDataAllocator, this_thread());
       d->alloc(trace[i].size_index); // content is never read (compression off), so skip memset
+      keep.push_back(make_ptr(d));
+      cache->put(&hash, d, d->block_size());
+    }
+    if ((i & 0xfff) == 0xfff) {
+      keep.clear(); // bound transient memory; the cache holds its own refs to resident objects
+    }
+  }
+  keep.clear();
+  return total ? static_cast<double>(hits) / total : 0.0;
+}
+
+// Streaming counterpart to test_RamCache_trace: replays a file trace in a single pass without
+// materializing it, measuring the hit rate over the second half. total_records is precomputed
+// (see ram_trace_count) so the per-algorithm runs need not re-count. Mirrors the vector version's
+// keying and put logic exactly, so the two agree on identical input.
+static double
+test_RamCache_trace_stream(RamCache *cache, int64_t cache_size, StripeSM *stripe, const char *path, int64_t total_records)
+{
+  cache->init(cache_size, stripe);
+  int64_t                        measure_from = total_records / 2; // warm up over the first half
+  TraceSource                    src(path);
+  std::vector<Ptr<IOBufferData>> keep;
+  int64_t                        hits = 0, total = 0;
+  uint64_t                       k  = 0;
+  int64_t                        sz = 0;
+  for (int64_t i = 0; i < total_records && src.next(k, sz); i++) {
+    if (sz > (1 << 20)) {
+      sz = 1 << 20; // clamp huge objects so the allocator stays bounded
+    }
+    int        size_index = static_cast<int>(iobuffer_size_to_index(sz, MAX_BUFFER_SIZE_INDEX));
+    CryptoHash hash;
+    hash.u64[0] = k; // preserve the full 64-bit object id (real traces use the whole range)
+    hash.u64[1] = k * 0x9e3779b97f4a7c15ull;
+    Ptr<IOBufferData> got;
+    bool              hit = cache->get(&hash, &got);
+    if (i >= measure_from) {
+      total++;
+      hits += hit ? 1 : 0;
+    }
+    if (!hit) {
+      IOBufferData *d = THREAD_ALLOC(ioDataAllocator, this_thread());
+      d->alloc(size_index); // content is never read (compression off), so skip memset
       keep.push_back(make_ptr(d));
       cache->put(&hash, d, d->block_size());
     }
@@ -1025,11 +1151,22 @@ REGRESSION_TEST(ram_cache_trace)(RegressionTest *t, int level, int *pstatus)
     if (char const *sz = getenv("TS_RAMCACHE_SIZE_MB")) {
       cache_size = atoll(sz) << 20;
     }
-    std::vector<RamTraceReq> trace = load_ram_trace(path);
-    rprintf(t, "RamCache trace file reqs=%zu\n", trace.size());
-    run_one("lru", "LRU", new_RamCacheLRU, cache_size, trace);
-    run_one("clfus", "CLFUS", new_RamCacheCLFUS, cache_size, trace);
-    run_one("wtinylfu", "WTinyLFU", new_RamCacheWTinyLFU, cache_size, trace);
+    // The trace is streamed, not loaded, so this caps run time, not memory (override with
+    // TS_RAMCACHE_MAXREQS). total_records is counted once and reused across the algorithms.
+    const char *cap_env       = getenv("TS_RAMCACHE_MAXREQS");
+    int64_t     max_reqs      = cap_env ? atoll(cap_env) : 40000000;
+    int64_t     total_records = ram_trace_count(path, max_reqs);
+    rprintf(t, "RamCache trace (streaming) reqs=%lld\n", (long long)total_records);
+    auto run_stream = [&](const char *want, const char *disp, RamCache *(*mk)()) {
+      if (alg && strcmp(alg, want) != 0) {
+        return;
+      }
+      double r = test_RamCache_trace_stream(mk(), cache_size, stripe, path, total_records);
+      rprintf(t, "RamCache trace %-8s size=%lld MB hit-rate %.3f\n", disp, (long long)(cache_size >> 20), r);
+    };
+    run_stream("lru", "LRU", new_RamCacheLRU);
+    run_stream("clfus", "CLFUS", new_RamCacheCLFUS);
+    run_stream("wtinylfu", "WTinyLFU", new_RamCacheWTinyLFU);
     *pstatus = REGRESSION_TEST_PASSED;
     return;
   }
