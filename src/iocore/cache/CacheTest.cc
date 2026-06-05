@@ -38,6 +38,9 @@
 #include <cstdio>
 #include <string>
 #include <sys/stat.h>
+#if TS_RAMCACHE_TEST_HAVE_ZSTD
+#include <zstd.h>
+#endif
 
 using namespace std::literals;
 
@@ -935,8 +938,9 @@ generate_ram_trace(int64_t key_universe, int64_t n_requests, double one_hit_frac
 //       { uint32 time; uint64 obj_id; uint32 obj_size; int64 next_access }   (".bin")
 //   - libCacheSim CSV export "time, object, size, next_access_vtime" with a '#' header (".csv")
 //   - whitespace text "<decimal-key> [size-bytes]" per line (any other extension)
-// Any of these may be zstd-compressed (".zst"), streamed through `zstd -dc`. This is test-only
-// code reading a developer-supplied path, hence the popen.
+// Any of these may be zstd-compressed (".zst"): a binary ".zst" is decompressed in process via
+// libzstd when available (TS_RAMCACHE_TEST_HAVE_ZSTD), otherwise (and for text ".zst") it is
+// streamed through `zstd -dc`. This is test-only code reading a developer-supplied path.
 static bool
 has_suffix(const std::string &s, const char *suffix)
 {
@@ -948,16 +952,26 @@ namespace
 {
 struct TraceSource {
   FILE       *_f      = nullptr;
-  bool        _pipe   = false; // decompressing through zstd
+  bool        _pipe   = false; // a ".zst" we did not decompress in process (shelling to `zstd -dc`)
   bool        _binary = false; // 24-byte oracleGeneral records
   bool        _csv    = false; // comma-separated, key is the 2nd field
+  bool        _zst    = false; // path ends in ".zst"
   std::string _path;
+#if TS_RAMCACHE_TEST_HAVE_ZSTD
+  // In-process zstd streaming (binary traces only): no temp file, no shell, low memory footprint.
+  ZSTD_DStream     *_zds = nullptr;
+  FILE             *_zf  = nullptr; // raw compressed input
+  std::vector<char> _zin_buf;
+  ZSTD_inBuffer     _zin    = {nullptr, 0, 0};
+  bool              _zeof   = false;
+  bool              _inproc = false;
+#endif
 
   explicit TraceSource(const char *path) : _path(path)
   {
     std::string inner = _path;
-    if (has_suffix(inner, ".zst")) {
-      _pipe = true;
+    _zst              = has_suffix(inner, ".zst");
+    if (_zst) {
       inner.resize(inner.size() - 4);
     }
     // libCacheSim oracleGeneral binaries are named ".oracleGeneral" or ".oracleGeneral.bin".
@@ -972,10 +986,23 @@ struct TraceSource {
   void
   _open()
   {
-    if (_pipe) {
-      // zstd -dc streams the decompressed bytes; quote the path (test-only, trusted input) and
-      // refuse a path containing a quote rather than build an unsafe command.
+    if (_zst) {
+#if TS_RAMCACHE_TEST_HAVE_ZSTD
+      if (_binary) { // decompress the binary trace in process -- no temp file, no shell
+        _zf = fopen(_path.c_str(), "rb");
+        if (_zf) {
+          _zds = ZSTD_createDStream();
+          ZSTD_initDStream(_zds);
+          _zin_buf.resize(ZSTD_DStreamInSize());
+          _inproc = true;
+          return;
+        }
+      }
+#endif
+      // Fallback (and text ".zst"): stream decompressed bytes through `zstd -dc`. Quote the path
+      // (test-only, trusted input) and refuse a path containing a quote rather than run unsafely.
       std::string cmd = "zstd -dcq '" + _path + "'";
+      _pipe           = true;
       _f              = _path.find('\'') == std::string::npos ? popen(cmd.c_str(), "r") : nullptr;
     } else {
       _f = fopen(_path.c_str(), _binary ? "rb" : "r");
@@ -984,22 +1011,61 @@ struct TraceSource {
   void
   _close()
   {
+#if TS_RAMCACHE_TEST_HAVE_ZSTD
+    if (_zds) {
+      ZSTD_freeDStream(_zds);
+      _zds = nullptr;
+    }
+    if (_zf) {
+      fclose(_zf);
+      _zf = nullptr;
+    }
+#endif
     if (_f) {
       _pipe ? pclose(_f) : fclose(_f);
       _f = nullptr;
     }
   }
 
+  // Fills dst with up to n decompressed bytes; returns the number actually read (< n at EOF).
+  size_t
+  _raw_read(void *dst, size_t n)
+  {
+#if TS_RAMCACHE_TEST_HAVE_ZSTD
+    if (_inproc) {
+      ZSTD_outBuffer out = {dst, n, 0};
+      while (out.pos < n) {
+        if (_zin.pos == _zin.size && !_zeof) {
+          size_t r  = fread(_zin_buf.data(), 1, _zin_buf.size(), _zf);
+          _zin.src  = _zin_buf.data();
+          _zin.size = r;
+          _zin.pos  = 0;
+          if (r == 0) {
+            _zeof = true;
+          }
+        }
+        size_t before = out.pos;
+        size_t ret    = ZSTD_decompressStream(_zds, &out, &_zin);
+        if (ZSTD_isError(ret)) {
+          break;
+        }
+        if (out.pos == before && _zin.pos == _zin.size && _zeof) {
+          break; // no input left and no progress made
+        }
+      }
+      return out.pos;
+    }
+#endif
+    return _f ? fread(dst, 1, n, _f) : 0;
+  }
+
   // Yields the next record's key and object size in bytes; false at end of stream.
   bool
   next(uint64_t &key, int64_t &size_bytes)
   {
-    if (!_f) {
-      return false;
-    }
     if (_binary) {
       unsigned char rec[24];
-      if (fread(rec, 1, sizeof(rec), _f) != sizeof(rec)) {
+      if (_raw_read(rec, sizeof(rec)) != sizeof(rec)) {
         return false;
       }
       uint64_t obj_id;
@@ -1009,6 +1075,9 @@ struct TraceSource {
       key        = obj_id;
       size_bytes = obj_size ? obj_size : 1;
       return true;
+    }
+    if (!_f) {
+      return false;
     }
     char line[512];
     while (fgets(line, sizeof(line), _f)) {
