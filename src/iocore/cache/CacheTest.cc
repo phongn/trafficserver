@@ -690,6 +690,8 @@ REGRESSION_TEST(ram_cache)(RegressionTest *t, int level, int *pstatus)
       *pstatus = REGRESSION_TEST_FAILED;
     }
     test_RamCache(t, new_RamCacheWTinyLFU(), "WTinyLFU", cache_size); // experimental, informational
+    test_RamCache(t, new_RamCacheSieve(), "Sieve", cache_size);       // experimental, informational
+    test_RamCache(t, new_RamCacheS3FIFO(), "S3FIFO", cache_size);     // experimental, informational
   }
 }
 
@@ -786,14 +788,18 @@ REGRESSION_TEST(ram_cache_adaptivity)(RegressionTest *t, int level, int *pstatus
   StripeSM *stripe     = theCache->key_to_stripe(&key, "example.com"sv);
   int64_t   cache_size = 1LL << 21; // 2 MB
 
-  RamCacheAdaptResult lru   = test_RamCache_adaptivity(new_RamCacheLRU(), cache_size, stripe);
-  RamCacheAdaptResult clfus = test_RamCache_adaptivity(new_RamCacheCLFUS(), cache_size, stripe);
-  RamCacheAdaptResult wtlfu = test_RamCache_adaptivity(new_RamCacheWTinyLFU(), cache_size, stripe);
+  RamCacheAdaptResult lru    = test_RamCache_adaptivity(new_RamCacheLRU(), cache_size, stripe);
+  RamCacheAdaptResult clfus  = test_RamCache_adaptivity(new_RamCacheCLFUS(), cache_size, stripe);
+  RamCacheAdaptResult wtlfu  = test_RamCache_adaptivity(new_RamCacheWTinyLFU(), cache_size, stripe);
+  RamCacheAdaptResult sieve  = test_RamCache_adaptivity(new_RamCacheSieve(), cache_size, stripe);
+  RamCacheAdaptResult s3fifo = test_RamCache_adaptivity(new_RamCacheS3FIFO(), cache_size, stripe);
 
   rprintf(t, "RamCache adaptivity after working-set shift (higher B-hit-rate / lower A-retained is better)\n");
   rprintf(t, "RamCache LRU      B-hit-rate %.3f  A-retained %d/%d\n", lru.b_hit_rate, lru.a_retained, lru.a_total);
   rprintf(t, "RamCache CLFUS    B-hit-rate %.3f  A-retained %d/%d\n", clfus.b_hit_rate, clfus.a_retained, clfus.a_total);
   rprintf(t, "RamCache WTinyLFU B-hit-rate %.3f  A-retained %d/%d\n", wtlfu.b_hit_rate, wtlfu.a_retained, wtlfu.a_total);
+  rprintf(t, "RamCache Sieve    B-hit-rate %.3f  A-retained %d/%d\n", sieve.b_hit_rate, sieve.a_retained, sieve.a_total);
+  rprintf(t, "RamCache S3FIFO   B-hit-rate %.3f  A-retained %d/%d\n", s3fifo.b_hit_rate, s3fifo.a_retained, s3fifo.a_total);
 
   // With the F2 fixes CLFUS must follow the shift: serve the new working set and release the stale one.
   *pstatus = (clfus.b_hit_rate >= 0.90 && clfus.a_retained <= clfus.a_total / 3) ? REGRESSION_TEST_PASSED : REGRESSION_TEST_FAILED;
@@ -865,14 +871,18 @@ REGRESSION_TEST(ram_cache_drift)(RegressionTest *t, int level, int *pstatus)
   StripeSM *stripe     = theCache->key_to_stripe(&key, "example.com"sv);
   int64_t   cache_size = 1LL << 21; // 2 MB
 
-  double lru   = test_RamCache_drift(new_RamCacheLRU(), cache_size, stripe);
-  double clfus = test_RamCache_drift(new_RamCacheCLFUS(), cache_size, stripe);
-  double wtlfu = test_RamCache_drift(new_RamCacheWTinyLFU(), cache_size, stripe);
+  double lru    = test_RamCache_drift(new_RamCacheLRU(), cache_size, stripe);
+  double clfus  = test_RamCache_drift(new_RamCacheCLFUS(), cache_size, stripe);
+  double wtlfu  = test_RamCache_drift(new_RamCacheWTinyLFU(), cache_size, stripe);
+  double sieve  = test_RamCache_drift(new_RamCacheSieve(), cache_size, stripe);
+  double s3fifo = test_RamCache_drift(new_RamCacheS3FIFO(), cache_size, stripe);
 
   rprintf(t, "RamCache gradual-drift current-window hit rate (higher is better)\n");
   rprintf(t, "RamCache LRU      drift-hit-rate %.3f\n", lru);
   rprintf(t, "RamCache CLFUS    drift-hit-rate %.3f\n", clfus);
   rprintf(t, "RamCache WTinyLFU drift-hit-rate %.3f\n", wtlfu);
+  rprintf(t, "RamCache Sieve    drift-hit-rate %.3f\n", sieve);
+  rprintf(t, "RamCache S3FIFO   drift-hit-rate %.3f\n", s3fifo);
 
   // With the F2 fixes CLFUS must track a rolling working set, not freeze on the initial cohort.
   *pstatus = (clfus >= 0.80) ? REGRESSION_TEST_PASSED : REGRESSION_TEST_FAILED;
@@ -1167,6 +1177,8 @@ REGRESSION_TEST(ram_cache_trace)(RegressionTest *t, int level, int *pstatus)
     run_stream("lru", "LRU", new_RamCacheLRU);
     run_stream("clfus", "CLFUS", new_RamCacheCLFUS);
     run_stream("wtinylfu", "WTinyLFU", new_RamCacheWTinyLFU);
+    run_stream("sieve", "Sieve", new_RamCacheSieve);
+    run_stream("s3fifo", "S3FIFO", new_RamCacheS3FIFO);
     *pstatus = REGRESSION_TEST_PASSED;
     return;
   }
@@ -1188,6 +1200,8 @@ REGRESSION_TEST(ram_cache_trace)(RegressionTest *t, int level, int *pstatus)
     run_one("lru", "LRU", new_RamCacheLRU, cache_size, trace);
     run_one("clfus", "CLFUS", new_RamCacheCLFUS, cache_size, trace);
     run_one("wtinylfu", "WTinyLFU", new_RamCacheWTinyLFU, cache_size, trace);
+    run_one("sieve", "Sieve", new_RamCacheSieve, cache_size, trace);
+    run_one("s3fifo", "S3FIFO", new_RamCacheS3FIFO, cache_size, trace);
   }
   *pstatus = REGRESSION_TEST_PASSED; // informational comparison
 }
@@ -1259,14 +1273,18 @@ REGRESSION_TEST(ram_cache_scan)(RegressionTest *t, int level, int *pstatus)
   StripeSM *stripe     = theCache->key_to_stripe(&key, "example.com"sv);
   int64_t   cache_size = 1LL << 23; // 8 MB
 
-  double lru   = test_RamCache_scan(new_RamCacheLRU(), cache_size, stripe);
-  double clfus = test_RamCache_scan(new_RamCacheCLFUS(), cache_size, stripe);
-  double wtlfu = test_RamCache_scan(new_RamCacheWTinyLFU(), cache_size, stripe);
+  double lru    = test_RamCache_scan(new_RamCacheLRU(), cache_size, stripe);
+  double clfus  = test_RamCache_scan(new_RamCacheCLFUS(), cache_size, stripe);
+  double wtlfu  = test_RamCache_scan(new_RamCacheWTinyLFU(), cache_size, stripe);
+  double sieve  = test_RamCache_scan(new_RamCacheSieve(), cache_size, stripe);
+  double s3fifo = test_RamCache_scan(new_RamCacheS3FIFO(), cache_size, stripe);
 
   rprintf(t, "RamCache scan resistance: hot-set hit rate under heavy one-time scan (higher is better)\n");
   rprintf(t, "RamCache LRU      scan-hot-hit-rate %.3f\n", lru);
   rprintf(t, "RamCache CLFUS    scan-hot-hit-rate %.3f\n", clfus);
   rprintf(t, "RamCache WTinyLFU scan-hot-hit-rate %.3f\n", wtlfu);
+  rprintf(t, "RamCache Sieve    scan-hot-hit-rate %.3f\n", sieve);
+  rprintf(t, "RamCache S3FIFO   scan-hot-hit-rate %.3f\n", s3fifo);
 
   *pstatus = REGRESSION_TEST_PASSED; // informational comparison
 }
@@ -1347,6 +1365,8 @@ REGRESSION_TEST(ram_cache_throughput)(RegressionTest *t, int level, int *pstatus
   test_RamCache_throughput(t, new_RamCacheLRU(), "LRU", cache_size, stripe);
   test_RamCache_throughput(t, new_RamCacheCLFUS(), "CLFUS", cache_size, stripe);
   test_RamCache_throughput(t, new_RamCacheWTinyLFU(), "WTinyLFU", cache_size, stripe);
+  test_RamCache_throughput(t, new_RamCacheSieve(), "Sieve", cache_size, stripe);
+  test_RamCache_throughput(t, new_RamCacheS3FIFO(), "S3FIFO", cache_size, stripe);
 
   *pstatus = REGRESSION_TEST_PASSED; // informational comparison
 }
