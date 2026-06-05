@@ -75,15 +75,17 @@ and reduces load on disks, especially during temporary traffic peaks.
 You can configure the RAM cache size to suit your needs, as described in
 :ref:`changing-the-size-of-the-ram-cache` below.
 
-The RAM cache supports three cache eviction algorithms: a regular *LRU*
-(Least Recently Used); the more advanced *CLFUS* (Clocked Least
+The RAM cache supports several cache eviction algorithms: the default
+*LRU* (Least Recently Used); the more advanced *CLFUS* (Clocked Least
 Frequently Used by Size; which balances recentness, frequency, and size
-to maximize hit rate, similar to a most frequently used algorithm); and
+to maximize hit rate, similar to a most frequently used algorithm);
 *W-TinyLFU* (Window TinyLFU, the policy used by Caffeine), which puts a
 small recency window in front of a frequency-filtered main cache and
-adapts the split between them to the workload. The default is to use
-*LRU*, and this is controlled via
-:ts:cv:`proxy.config.cache.ram_cache.algorithm`.
+adapts the split between them to the workload; and two experimental
+FIFO-based policies, *SIEVE* and *S3-FIFO*, which achieve strong hit
+rates on web/CDN and key-value workloads at very low per-access cost.
+The choice is controlled via
+:ts:cv:`proxy.config.cache.ram_cache.algorithm`, which documents each.
 
 Both the *LRU* and *CLFUS* RAM caches support a configuration to increase
 scan resistance. In a typical *LRU*, if you request all possible objects in

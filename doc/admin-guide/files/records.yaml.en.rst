@@ -2892,7 +2892,7 @@ RAM Cache
 
 .. ts:cv:: CONFIG proxy.config.cache.ram_cache.algorithm INT 1
 
-   Three RAM cache eviction algorithms are supported, selected by this value:
+   Five RAM cache eviction algorithms are supported, selected by this value:
 
    ``1``
        **LRU** (*Least Recently Used*), the default -- the simplest policy,
@@ -2913,6 +2913,25 @@ RAM Cache
        adaptive, so it tracks recency-heavy and frequency-heavy workloads
        without tuning. It is scan-resistant by design and does not use the
        seen filter. It does not support in-RAM compression.
+
+   ``3``
+       **SIEVE**: a single FIFO-ordered list with a "visited" bit and a lazy
+       eviction hand. The simplest of the advanced policies and the cheapest
+       per access (a hit only sets a bit), with memory close to LRU's. Strong
+       on real web/CDN traffic, but having no admission filter it is weaker
+       under adversarial scans than the others. Experimental.
+
+   ``4``
+       **S3-FIFO** (*Simple Scalable Static FIFO*): a small admission queue and
+       a main queue (both FIFO), plus a ghost queue of recently evicted keys,
+       which together filter one-hit-wonders. Scan-resistant, inexpensive, and
+       the strongest hit rate of these on CDN and key-value traces in testing.
+       Experimental; does not support in-RAM compression.
+
+   The eviction metadata of every algorithm is accounted against this cache
+   size, so the resident memory stays within
+   :ts:cv:`proxy.config.cache.ram_cache.size` regardless of the algorithm
+   chosen.
 
 .. ts:cv:: CONFIG proxy.config.cache.ram_cache.use_seen_filter INT 1
 
