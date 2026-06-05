@@ -176,23 +176,13 @@ RamCacheWTinyLFU::init(int64_t abytes, StripeSM *astripe)
   }
   const char *window_env = getenv("TS_WTLFU_WINDOW_PCT");
   int         window_pct = window_env ? atoi(window_env) : WINDOW_PERCENT;
-  _protected_pct         = wtlfu_env_int("TS_WTLFU_PROTECTED_PCT", PROTECTED_PERCENT);
-  _window_limit          = _max_bytes * window_pct / 100;
-  _protected_limit       = (_max_bytes - _window_limit) * _protected_pct / 100;
-  // Hill-climb the window between 1% and 80% of the cache (see _adapt_window), unless it was
-  // pinned via TS_WTLFU_WINDOW_PCT (which is for experiments / sweeps).
-  _adapt       = (window_env == nullptr) && wtlfu_env_int("TS_WTLFU_ADAPT", 1) != 0;
-  _window_lo   = _max_bytes / 100;
-  _window_hi   = _max_bytes * 80 / 100;
-  _window_step = _max_bytes * ADAPT_STEP_PERCENT / 100;
-  _resize_hashtable();
 
   // Size the frequency sketch to roughly the entry capacity (rounded up to a power of two), and
   // age it (halve every counter) once it has recorded ~ capacity * CMS_SAMPLE_FACTOR accesses.
   // The reset is tied to capacity in entries, NOT the sketch width: this is the TinyLFU aging
   // that decays a once-hot key's estimate as the working set turns over, so W-TinyLFU can follow
   // a shifting working set.
-  int64_t est_objects = _max_bytes / AVG_OBJECT_ESTIMATE;
+  int64_t est_objects = abytes / AVG_OBJECT_ESTIMATE;
   if (est_objects < 64) {
     est_objects = 64;
   }
@@ -201,14 +191,31 @@ RamCacheWTinyLFU::init(int64_t abytes, StripeSM *astripe)
     width <<= 1;
   }
   _freq.assign(width * CMS_DEPTH, 0);
-  _freq_mask   = width - 1;
-  _freq_sample = 0;
-  _freq_reset  = est_objects * wtlfu_env_int("TS_WTLFU_SAMPLE_FACTOR", CMS_SAMPLE_FACTOR);
-
+  _freq_mask      = width - 1;
+  _freq_sample    = 0;
+  _freq_reset     = est_objects * wtlfu_env_int("TS_WTLFU_SAMPLE_FACTOR", CMS_SAMPLE_FACTOR);
   _adapt_interval = est_objects * 10; // re-evaluate the window roughly every 10 cache turnovers
   if (_adapt_interval < 10000) {
     _adapt_interval = 10000;
   }
+
+  // Reserve the sketch's memory so the data budget (window + main) plus the sketch stays within
+  // the configured ram_cache.size.
+  int64_t sketch_bytes = static_cast<int64_t>(_freq.size());
+  if (_max_bytes > sketch_bytes * 2) {
+    _max_bytes -= sketch_bytes;
+  }
+
+  _protected_pct   = wtlfu_env_int("TS_WTLFU_PROTECTED_PCT", PROTECTED_PERCENT);
+  _window_limit    = _max_bytes * window_pct / 100;
+  _protected_limit = (_max_bytes - _window_limit) * _protected_pct / 100;
+  // Hill-climb the window between 1% and 80% of the cache (see _adapt_window), unless it was
+  // pinned via TS_WTLFU_WINDOW_PCT (which is for experiments / sweeps).
+  _adapt       = (window_env == nullptr) && wtlfu_env_int("TS_WTLFU_ADAPT", 1) != 0;
+  _window_lo   = _max_bytes / 100;
+  _window_hi   = _max_bytes * 80 / 100;
+  _window_step = _max_bytes * ADAPT_STEP_PERCENT / 100;
+  _resize_hashtable();
 }
 
 uint64_t

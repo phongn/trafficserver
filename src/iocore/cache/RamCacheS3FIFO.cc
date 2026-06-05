@@ -42,11 +42,11 @@
 #include "iocore/eventsystem/IOBuffer.h"
 #include "tscore/CryptoHash.h"
 #include "tscore/List.h"
-#include <vector>
 
-#define ENTRY_OVERHEAD         128 // per-entry overhead counted against ram_cache.size
+#define ENTRY_OVERHEAD         128 // per-entry metadata counted against ram_cache.size
 #define MAIN_PERCENT           90  // main queue target size, percent of capacity
-#define GHOST_PERCENT          90  // ghost queue holds keys summing to ~this percent of capacity
+#define GHOST_SIZE_PERCENT     90  // ghost remembers keys for ~this percent of capacity by object size
+#define GHOST_MEM_PERCENT      25  // but never more ghost metadata than this percent of size (OOM-safe)
 #define MOVE_TO_MAIN_THRESHOLD 2   // an object in S is promoted to M once reused this many times
 #define FREQ_MAX               3   // 2-bit saturating frequency counter
 
@@ -55,7 +55,7 @@ enum { SEG_SMALL = 0, SEG_MAIN = 1, SEG_GHOST = 2 };
 struct RamCacheS3FIFOEntry {
   CryptoHash key;
   uint64_t   auxkey;
-  uint32_t   size; // object bytes (resident entries account size + ENTRY_OVERHEAD; ghost uses size)
+  uint32_t   size; // object bytes; resident entries account size + ENTRY_OVERHEAD against the budget
   uint8_t    seg;  // SEG_SMALL / SEG_MAIN / SEG_GHOST
   uint8_t    freq; // 0..FREQ_MAX
   LINK(RamCacheS3FIFOEntry, lru_link);
@@ -71,14 +71,15 @@ struct RamCacheS3FIFO : public RamCache {
   void    init(int64_t max_bytes, StripeSM *stripe) override;
 
 private:
-  int64_t _max_bytes   = 0;
-  int64_t _main_limit  = 0;
-  int64_t _ghost_limit = 0;
-  int64_t _s_bytes     = 0; // resident bytes in the small queue (incl. ENTRY_OVERHEAD per entry)
-  int64_t _m_bytes     = 0; // resident bytes in the main queue
-  int64_t _g_bytes     = 0; // ghost queue budget (sum of remembered object sizes)
-  int64_t _objects     = 0; // resident objects (S + M)
-  int64_t _nentries    = 0; // hash entries (resident + ghost), for sizing the hash table
+  int64_t _max_bytes        = 0;
+  int64_t _ghost_size_limit = 0; // ghost object-size bound (keeps it proportional for big objects)
+  int64_t _ghost_max        = 0; // ghost entry-count bound (caps metadata to GHOST_MEM_PERCENT)
+  int64_t _s_bytes          = 0; // resident bytes in the small queue (incl. ENTRY_OVERHEAD per entry)
+  int64_t _m_bytes          = 0; // resident bytes in the main queue
+  int64_t _g_bytes          = 0; // ghost object-size sum (vs _ghost_size_limit)
+  int64_t _g_count          = 0; // ghost entries; each costs ~ENTRY_OVERHEAD, counted in the budget
+  int64_t _objects          = 0; // resident objects (S + M)
+  int64_t _nentries         = 0; // hash entries (resident + ghost), for sizing the hash table
 
   Que(RamCacheS3FIFOEntry, lru_link) _seg[3]; // head = oldest, tail = newest, per segment
   DList(RamCacheS3FIFOEntry, hash_link) *_bucket = nullptr;
@@ -91,6 +92,7 @@ private:
   void                 _unlink_hash(RamCacheS3FIFOEntry *e);
   void                 _to_main(RamCacheS3FIFOEntry *e);
   void                 _to_ghost(RamCacheS3FIFOEntry *e);
+  bool                 _evict_ghost_one();
   void                 _enforce_ghost();
   void                 _evict_small();
   void                 _evict_main();
@@ -105,6 +107,7 @@ static const int bucket_sizes[] = {8191,    16381,   32749,    65521,    131071,
 void
 RamCacheS3FIFO::_resize_hashtable()
 {
+  ink_release_assert(_ibuckets < static_cast<int>(sizeof(bucket_sizes) / sizeof(bucket_sizes[0])));
   int     anbuckets = bucket_sizes[_ibuckets];
   int64_t s         = anbuckets * sizeof(DList(RamCacheS3FIFOEntry, hash_link));
 
@@ -131,8 +134,12 @@ RamCacheS3FIFO::init(int64_t abytes, StripeSM *astripe)
   if (!_max_bytes) {
     return;
   }
-  _main_limit  = _max_bytes * MAIN_PERCENT / 100;
-  _ghost_limit = _max_bytes * GHOST_PERCENT / 100;
+  _ghost_size_limit = _max_bytes / 100 * GHOST_SIZE_PERCENT;
+  // The ghost stores keys only, but each key still costs ~ENTRY_OVERHEAD of real memory. Bound the
+  // ghost by both its object-size sum (keeps it proportional for large objects) and an entry count
+  // that caps its metadata at GHOST_MEM_PERCENT of the configured size; the metadata is counted
+  // against the budget (see put) so total memory never exceeds ram_cache.size.
+  _ghost_max = (_max_bytes / 100 * GHOST_MEM_PERCENT) / ENTRY_OVERHEAD;
   _resize_hashtable();
 }
 
@@ -201,23 +208,31 @@ RamCacheS3FIFO::_to_ghost(RamCacheS3FIFOEntry *e)
   e->freq = 0;
   _seg[SEG_GHOST].enqueue(e);
   _g_bytes += e->size;
+  _g_count++;
   _objects--;
   _enforce_ghost();
+}
+
+// Drop the oldest ghost key; returns false if the ghost was already empty.
+bool
+RamCacheS3FIFO::_evict_ghost_one()
+{
+  RamCacheS3FIFOEntry *g = _seg[SEG_GHOST].dequeue();
+  if (!g) {
+    return false;
+  }
+  _g_bytes -= g->size;
+  _g_count--;
+  _unlink_hash(g);
+  _nentries--;
+  ramCacheS3FIFOEntryAllocator.free(g);
+  return true;
 }
 
 void
 RamCacheS3FIFO::_enforce_ghost()
 {
-  while (_g_bytes > _ghost_limit) {
-    RamCacheS3FIFOEntry *g = _seg[SEG_GHOST].dequeue();
-    if (!g) {
-      break;
-    }
-    _g_bytes -= g->size;
-    _unlink_hash(g);
-    _nentries--;
-    ramCacheS3FIFOEntryAllocator.free(g);
-  }
+  while ((_g_bytes > _ghost_size_limit || _g_count > _ghost_max) && _evict_ghost_one()) {}
 }
 
 // Evict from the small queue: promote reused objects to main, demote the first un-reused object to
@@ -246,7 +261,7 @@ RamCacheS3FIFO::_evict_main()
     RamCacheS3FIFOEntry *c = _seg[SEG_MAIN].head;
     if (c->freq >= 1) {
       _seg[SEG_MAIN].remove(c);
-      c->freq = (c->freq > FREQ_MAX ? FREQ_MAX : c->freq) - 1;
+      c->freq -= 1; // 2-bit clock: a reused object gets another pass (freq is already <= FREQ_MAX)
       _seg[SEG_MAIN].enqueue(c);
     } else {
       _seg[SEG_MAIN].remove(c);
@@ -266,7 +281,11 @@ RamCacheS3FIFO::_evict_main()
 void
 RamCacheS3FIFO::_evict()
 {
-  if (_m_bytes > _main_limit || _s_bytes == 0) {
+  // Main targets MAIN_PERCENT of the budget actually available to resident data -- the ghost's
+  // metadata is reserved out of the configured size, so basing the split on raw _max_bytes would
+  // (when the ghost is full) keep _m_bytes below the limit forever and starve the small queue.
+  int64_t resident_budget = _max_bytes - _g_count * ENTRY_OVERHEAD;
+  if (_m_bytes > resident_budget * MAIN_PERCENT / 100 || _s_bytes == 0) {
     _evict_main();
   } else {
     _evict_small();
@@ -313,15 +332,23 @@ RamCacheS3FIFO::put(CryptoHash *key, IOBufferData *data, [[maybe_unused]] uint32
     // hit on the ghost: drop the ghost record and admit a fresh copy straight to the main queue
     _seg[SEG_GHOST].remove(e);
     _g_bytes -= e->size;
+    _g_count--;
     _unlink_hash(e);
     _nentries--;
     ramCacheS3FIFOEntryAllocator.free(e);
     ghost_hit = true;
   }
 
+  // Keep total memory within the configured size: resident data+overhead plus the ghost's
+  // metadata (ENTRY_OVERHEAD per remembered key) must fit. Evict resident first; if that is
+  // exhausted but ghost metadata still pushes over, drop ghost keys too.
   int64_t need = ENTRY_OVERHEAD + size;
-  while (_s_bytes + _m_bytes + need > _max_bytes && (_s_bytes + _m_bytes) > 0) {
-    _evict();
+  while (_s_bytes + _m_bytes + _g_count * ENTRY_OVERHEAD + need > _max_bytes) {
+    if (_s_bytes + _m_bytes > 0) {
+      _evict();
+    } else if (!_evict_ghost_one()) {
+      break; // nothing left to free (a single object larger than the whole cache)
+    }
   }
 
   uint32_t             i  = key->slice32(3) % _nbuckets;

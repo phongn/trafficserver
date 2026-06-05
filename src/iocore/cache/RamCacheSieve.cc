@@ -42,7 +42,6 @@
 #include "iocore/eventsystem/IOBuffer.h"
 #include "tscore/CryptoHash.h"
 #include "tscore/List.h"
-#include <vector>
 
 #define ENTRY_OVERHEAD 128 // per-entry overhead counted against ram_cache.size
 
@@ -87,6 +86,7 @@ static const int bucket_sizes[] = {8191,    16381,   32749,    65521,    131071,
 void
 RamCacheSieve::_resize_hashtable()
 {
+  ink_release_assert(_ibuckets < static_cast<int>(sizeof(bucket_sizes) / sizeof(bucket_sizes[0])));
   int     anbuckets = bucket_sizes[_ibuckets];
   int64_t s         = anbuckets * sizeof(DList(RamCacheSieveEntry, hash_link));
 
