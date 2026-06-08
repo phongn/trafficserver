@@ -45,3 +45,6 @@ public:
 
 RamCache *new_RamCacheLRU();
 RamCache *new_RamCacheCLFUS();
+RamCache *new_RamCacheWTinyLFU();
+RamCache *new_RamCacheSieve();
+RamCache *new_RamCacheS3FIFO();

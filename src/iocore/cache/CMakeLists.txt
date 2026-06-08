@@ -33,6 +33,9 @@ add_library(
   PreservationTable.cc
   RamCacheCLFUS.cc
   RamCacheLRU.cc
+  RamCacheS3FIFO.cc
+  RamCacheSieve.cc
+  RamCacheWTinyLFU.cc
   Store.cc
   Stripe.cc
   StripeSM.cc
@@ -54,6 +57,28 @@ target_link_libraries(
 
 if(HAVE_LZMA_H)
   target_link_libraries(inkcache PRIVATE LibLZMA::LibLZMA)
+endif()
+
+# Optional: let the RAM cache benchmark (CacheTest.cc) stream-decompress zstd trace files in
+# process rather than shelling out to `zstd -dc`. The top-level find_package(zstd CONFIG) misses
+# a libzstd that ships without a CMake config (common on distros), so fall back to pkg-config.
+if(BUILD_REGRESSION_TESTING)
+  set(_ramcache_zstd_target "")
+  if(TARGET zstd::zstd)
+    set(_ramcache_zstd_target zstd::zstd)
+  else()
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+      pkg_check_modules(RAMCACHE_ZSTD QUIET IMPORTED_TARGET libzstd)
+      if(TARGET PkgConfig::RAMCACHE_ZSTD)
+        set(_ramcache_zstd_target PkgConfig::RAMCACHE_ZSTD)
+      endif()
+    endif()
+  endif()
+  if(_ramcache_zstd_target)
+    target_link_libraries(inkcache PRIVATE ${_ramcache_zstd_target})
+    target_compile_definitions(inkcache PRIVATE TS_RAMCACHE_TEST_HAVE_ZSTD=1)
+  endif()
 endif()
 
 if(BUILD_TESTING)

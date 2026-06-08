@@ -2892,10 +2892,46 @@ RAM Cache
 
 .. ts:cv:: CONFIG proxy.config.cache.ram_cache.algorithm INT 1
 
-   Two distinct RAM caches are supported, the default (1) being the simpler
-   **LRU** (*Least Recently Used*) cache. As an alternative, the **CLFUS**
-   (*Clocked Least Frequently Used by Size*) is also available, by changing this
-   configuration to 0.
+   Five RAM cache eviction algorithms are supported, selected by this value:
+
+   ``1``
+       **LRU** (*Least Recently Used*), the default -- the simplest policy,
+       favoring recency. Pairs with
+       :ts:cv:`proxy.config.cache.ram_cache.use_seen_filter` for scan
+       resistance.
+
+   ``0``
+       **CLFUS** (*Clocked Least Frequently Used by Size*), which balances
+       recency, frequency, and object size. It is the only algorithm that
+       supports in-RAM compression
+       (:ts:cv:`proxy.config.cache.ram_cache.compress`).
+
+   ``2``
+       **W-TinyLFU** (*Window TinyLFU*, the policy used by Caffeine): a small
+       recency **window** in front of a frequency-filtered main cache, with
+       admission gated by an aged frequency sketch. The window/main split is
+       adaptive, so it tracks recency-heavy and frequency-heavy workloads
+       without tuning. It is scan-resistant by design and does not use the
+       seen filter. It does not support in-RAM compression.
+
+   ``3``
+       **SIEVE**: a single FIFO-ordered list with a "visited" bit and a lazy
+       eviction hand. The simplest of the advanced policies and the cheapest
+       per access (a hit only sets a bit), with memory close to LRU's. Strong
+       on real web/CDN traffic, but having no admission filter it is weaker
+       under adversarial scans than the others. Experimental.
+
+   ``4``
+       **S3-FIFO** (*Simple Scalable Static FIFO*): a small admission queue and
+       a main queue (both FIFO), plus a ghost queue of recently evicted keys,
+       which together filter one-hit-wonders. Scan-resistant, inexpensive, and
+       the strongest hit rate of these on CDN and key-value traces in testing.
+       Experimental; does not support in-RAM compression.
+
+   The eviction metadata of every algorithm is accounted against this cache
+   size, so the resident memory stays within
+   :ts:cv:`proxy.config.cache.ram_cache.size` regardless of the algorithm
+   chosen.
 
 .. ts:cv:: CONFIG proxy.config.cache.ram_cache.use_seen_filter INT 1
 

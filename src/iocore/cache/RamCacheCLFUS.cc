@@ -31,6 +31,7 @@
 #include "iocore/eventsystem/Tasks.h"
 #include "fastlz/fastlz.h"
 #include "tscore/CryptoHash.h"
+#include "tscore/Regression.h"
 #include <zlib.h>
 #ifdef HAVE_LZMA_H
 #include <lzma.h>
@@ -39,12 +40,20 @@
 #define REQUIRED_COMPRESSION 0.9 // must get to this size or declared incompressible
 #define REQUIRED_SHRINK      0.8 // must get to this size or keep original buffer (with padding)
 #define HISTORY_HYSTERIA     10  // extra temporary history
-#define ENTRY_OVERHEAD       256 // per-entry overhead to consider when computing cache value/size
-#define LZMA_BASE_MEMLIMIT   (64 * 1024 * 1024)
+// HISTORY_DIVISOR caps the history (ghost) list at ~ _objects / HISTORY_DIVISOR entries. The
+// ghost list only needs to remember recent eviction candidates long enough to be requested
+// again; it does not need a full cache-worth. Each ghost entry is a full RamCacheCLFUSEntry
+// (~88 bytes) and is unbudgeted -- it is not counted against ram_cache.size -- so a full
+// cache-worth is a large memory cost for caches of many small objects. Testing showed a quarter
+// preserves CLFUS's adaptivity to a shifting working set (a half or eighth also work; an eighth
+// begins to slip). See doc/developer-guide/cache-architecture/ram-cache.en.rst.
+#define HISTORY_DIVISOR    4
+#define ENTRY_OVERHEAD     256 // per-entry overhead to consider when computing cache value/size
+#define LZMA_BASE_MEMLIMIT (64 * 1024 * 1024)
 // #define CHECK_ACOUNTING 1 // very expensive double checking of all sizes
 
 #define REQUEUE_HITS(_h)              ((_h) ? ((_h) - 1) : 0)
-#define CACHE_VALUE_HITS_SIZE(_h, _s) (static_cast<float>(((_h) + 1) / ((_s) + ENTRY_OVERHEAD)))
+#define CACHE_VALUE_HITS_SIZE(_h, _s) (static_cast<float>((_h) + 1) / ((_s) + ENTRY_OVERHEAD))
 #define CACHE_VALUE(_x)               CACHE_VALUE_HITS_SIZE((_x)->hits, (_x)->size)
 
 #define AVERAGE_VALUE_OVER 100
@@ -107,6 +116,7 @@ private:
 
   double  _average_value                        = 0;
   int64_t _history                              = 0;
+  int64_t _age_clock                            = 0; // accesses since the last resident aging pass
   int     _ibuckets                             = 0;
   int     _nbuckets                             = 0;
   DList(RamCacheCLFUSEntry, hash_link) *_bucket = nullptr;
@@ -120,7 +130,8 @@ private:
   void                _move_compressed(RamCacheCLFUSEntry *e);
   RamCacheCLFUSEntry *_destroy(RamCacheCLFUSEntry *e);
   void                _requeue_victims(Que(RamCacheCLFUSEntry, lru_link) & victims);
-  void                _tick(); // move CLOCK on history
+  void                _tick();         // move CLOCK on history
+  void                _age_resident(); // periodically halve resident hit counts so the hot set ages
 };
 
 int64_t
@@ -355,19 +366,21 @@ RamCacheCLFUS::_tick()
   if (!e) {
     return;
   }
+  // Age the oldest history entry and keep it: the history list is a bounded record of recently
+  // evicted/seen keys, so a key requested again soon can be re-admitted cheaply. Previously an
+  // entry was freed the moment its aged count reached 0, which held the list near-empty and
+  // denied that second chance; now we free only to keep the list at its target size.
   e->hits >>= 1;
-  if (e->hits) {
-    e->hits = REQUEUE_HITS(e->hits);
-    this->_lru[1].enqueue(e);
-  } else {
-    goto Lfree;
-  }
-  if (this->_history <= this->_objects + HISTORY_HYSTERIA) {
+  e->hits   = REQUEUE_HITS(e->hits);
+  this->_lru[1].enqueue(e);
+  // Cap the history list well below the resident count: it only needs to remember recent
+  // eviction candidates long enough to be re-requested, and a full cache-worth of ghost entries
+  // is a large, unbudgeted memory cost for caches with many small objects.
+  if (this->_history <= this->_objects / HISTORY_DIVISOR + HISTORY_HYSTERIA) {
     return;
   }
   e = this->_lru[1].dequeue();
-Lfree:
-  if (!e) { // e may be nullptr after e= lru[1].dequeue()
+  if (!e) {
     return;
   }
   e->flag_bits.lru = 0;
@@ -387,6 +400,24 @@ RamCacheCLFUS::_victimize(RamCacheCLFUSEntry *e)
   e->flag_bits.lru = 1;
   this->_lru[1].enqueue(e);
   this->_history++;
+}
+
+// Halve every resident hit count. Called periodically from put() so a once-hot object's
+// frequency advantage decays over time; without this CLFUS never ages lru[0] and a stale hot
+// set pins the cache against a shifting working set. Decaying every entry (rather than only
+// the eviction-scan survivors) is what lets _average_value fall and admit the new working set.
+void
+RamCacheCLFUS::_age_resident()
+{
+  forl_LL(RamCacheCLFUSEntry, e, this->_lru[0])
+  {
+    e->hits >>= 1;
+  }
+  // Decay the admission bar in step with the values it tracks. _average_value otherwise only
+  // changes inside the eviction loop, which is gated by _average_value itself (put() rejects a
+  // re-referenced entry whose value is below it). Without halving it too, aging the resident hit
+  // counts is invisible to that gate and a warming working set can never break in.
+  this->_average_value *= 0.5;
 }
 
 void
@@ -595,6 +626,12 @@ RamCacheCLFUS::put(CryptoHash *key, IOBufferData *data, uint32_t len, bool copy,
   if (!this->_max_bytes) {
     return 0;
   }
+  // Age the resident set once per "turnover" (a put for every resident object). This is the
+  // CLOCK aging that lets a cold-but-once-hot working set fall below average and be evicted.
+  if (this->_objects > 0 && ++this->_age_clock >= this->_objects) {
+    this->_age_resident();
+    this->_age_clock = 0;
+  }
   uint32_t            i            = key->slice32(3) % this->_nbuckets;
   RamCacheCLFUSEntry *e            = this->_bucket[i].head;
   uint32_t            size         = copy ? len : data->block_size();
@@ -656,7 +693,7 @@ RamCacheCLFUS::put(CryptoHash *key, IOBufferData *data, uint32_t len, bool copy,
     uint16_t k     = key->slice32(3) >> 16;
     uint16_t kk    = this->_seen[s];
     this->_seen[s] = k;
-    if (this->_history >= this->_objects && kk != k) {
+    if (this->_history >= this->_objects / HISTORY_DIVISOR && kk != k) {
       DDbg(dbg_ctl_ram_cache, "put %X %" PRId64 " size %d UNSEEN", key->slice32(3), auxkey, size);
       return 0;
     }
@@ -791,4 +828,34 @@ new_RamCacheCLFUS()
 {
   RamCacheCLFUS *r = new RamCacheCLFUS;
   return r;
+}
+
+// Guards against PR #11733-style regressions of the CLFUS value metric: the value density
+// must be computed in floating point. Integer division truncates (hits + 1) / (size + overhead)
+// to 0 for normal object sizes, zeroing the metric and silently collapsing CLFUS to FIFO (no
+// promote-on-hit, no clock second chance, no value-based ghost re-admission).
+REGRESSION_TEST(ram_cache_clfus_value)(RegressionTest *t, int /* level ATS_UNUSED */, int *pstatus)
+{
+  *pstatus = REGRESSION_TEST_PASSED;
+
+  float v_one   = CACHE_VALUE_HITS_SIZE(1u, 16384u);   // a typical 16 KiB object, seen once
+  float v_hot   = CACHE_VALUE_HITS_SIZE(100u, 16384u); // same size, many more hits
+  float v_small = CACHE_VALUE_HITS_SIZE(10u, 1024u);   // smaller object, equal hits
+  float v_large = CACHE_VALUE_HITS_SIZE(10u, 16384u);
+
+  // A non-zero fraction: the integer-division regression makes this exactly 0.0f.
+  if (!(v_one > 0.0f)) {
+    rprintf(t, "CLFUS value metric truncated to zero (integer division)\n");
+    *pstatus = REGRESSION_TEST_FAILED;
+  }
+  // Frequency aware: more hits at equal size must rank higher.
+  if (!(v_hot > v_one)) {
+    rprintf(t, "CLFUS value metric does not increase with hits\n");
+    *pstatus = REGRESSION_TEST_FAILED;
+  }
+  // Size aware (the "by Size" in CLFUS): smaller objects at equal hits must rank higher.
+  if (!(v_small > v_large)) {
+    rprintf(t, "CLFUS value metric does not decrease with size\n");
+    *pstatus = REGRESSION_TEST_FAILED;
+  }
 }

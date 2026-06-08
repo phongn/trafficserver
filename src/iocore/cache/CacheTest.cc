@@ -31,6 +31,16 @@
 #include "tscore/Random.h"
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
+#include <chrono>
+#include <fstream>
+#include <sstream>
+#include <cstdio>
+#include <string>
+#include <sys/stat.h>
+#if TS_RAMCACHE_TEST_HAVE_ZSTD
+#include <zstd.h>
+#endif
 
 using namespace std::literals;
 
@@ -682,5 +692,750 @@ REGRESSION_TEST(ram_cache)(RegressionTest *t, int level, int *pstatus)
     if (!test_RamCache(t, new_RamCacheLRU(), "LRU", cache_size) || !test_RamCache(t, new_RamCacheCLFUS(), "CLFUS", cache_size)) {
       *pstatus = REGRESSION_TEST_FAILED;
     }
+    test_RamCache(t, new_RamCacheWTinyLFU(), "WTinyLFU", cache_size); // experimental, informational
+    test_RamCache(t, new_RamCacheSieve(), "Sieve", cache_size);       // experimental, informational
+    test_RamCache(t, new_RamCacheS3FIFO(), "S3FIFO", cache_size);     // experimental, informational
   }
+}
+
+// Measures how well a RAM cache adapts when the hot working set shifts. Phase 1 warms set A to
+// (most of) the cache; phase 2 shifts every reference to a disjoint set B of the same size. A
+// frequency policy that never ages resident hit counts keeps the now-cold A pinned and starves
+// B (low B hit rate, high A retention); a recency or properly-aged policy releases A.
+struct RamCacheAdaptResult {
+  double b_hit_rate = 0.0;
+  int    a_retained = 0;
+  int    a_total    = 0;
+};
+
+static RamCacheAdaptResult
+test_RamCache_adaptivity(RamCache *cache, int64_t cache_size, StripeSM *stripe)
+{
+  cache->init(cache_size, stripe);
+
+  int const      obj    = BUFFER_SIZE_FOR_INDEX(BUFFER_SIZE_INDEX_16K);
+  int const      nhot   = static_cast<int>((cache_size / obj) * 7 / 8); // working set ~7/8 of capacity
+  int const      p1     = 20;                                           // rounds warming A
+  int const      p2     = 26;                                           // rounds referencing B
+  uint64_t const a_base = 1;
+  uint64_t const b_base = 1000000;
+
+  std::vector<Ptr<IOBufferData>> keep;
+  auto                           access = [&](uint64_t k) -> bool {
+    CryptoHash hash;
+    hash.u64[0] = (k << 32) + k;
+    hash.u64[1] = (k << 32) + k;
+    Ptr<IOBufferData> got;
+    if (cache->get(&hash, &got)) {
+      return true;
+    }
+    IOBufferData *d = THREAD_ALLOC(ioDataAllocator, this_thread());
+    d->alloc(BUFFER_SIZE_INDEX_16K);
+    memset(d->data(), 0, d->block_size());
+    keep.push_back(make_ptr(d));
+    cache->put(&hash, d, d->block_size());
+    return false;
+  };
+
+  for (int r = 0; r < p1; r++) { // warm A to the cache
+    for (int i = 0; i < nhot; i++) {
+      access(a_base + i);
+    }
+    keep.clear();
+  }
+
+  int b_hits = 0, b_total = 0;
+  for (int r = 0; r < p2; r++) { // shift all references to B
+    for (int i = 0; i < nhot; i++) {
+      bool hit = access(b_base + i);
+      if (r >= p2 / 2) { // measure once B has had a chance to establish
+        b_total++;
+        b_hits += hit ? 1 : 0;
+      }
+    }
+    keep.clear();
+  }
+
+  int a_ret = 0;
+  for (int i = 0; i < nhot; i++) {
+    CryptoHash hash;
+    hash.u64[0] = ((a_base + i) << 32) + (a_base + i);
+    hash.u64[1] = ((a_base + i) << 32) + (a_base + i);
+    Ptr<IOBufferData> got;
+    if (cache->get(&hash, &got)) {
+      a_ret++;
+    }
+  }
+  keep.clear();
+
+  RamCacheAdaptResult res;
+  res.b_hit_rate = b_total ? static_cast<double>(b_hits) / b_total : 0.0;
+  res.a_retained = a_ret;
+  res.a_total    = nhot;
+  return res;
+}
+
+REGRESSION_TEST(ram_cache_adaptivity)(RegressionTest *t, int level, int *pstatus)
+{
+  if (REGRESSION_TEST_NIGHTLY > level) {
+    *pstatus = REGRESSION_TEST_PASSED;
+    return;
+  }
+  if (cacheProcessor.IsCacheEnabled() != CacheInitState::INITIALIZED) {
+    rprintf(t, "cache not initialized");
+    *pstatus = REGRESSION_TEST_FAILED;
+    return;
+  }
+
+  CacheKey  key;
+  StripeSM *stripe     = theCache->key_to_stripe(&key, "example.com"sv);
+  int64_t   cache_size = 1LL << 21; // 2 MB
+
+  RamCacheAdaptResult lru    = test_RamCache_adaptivity(new_RamCacheLRU(), cache_size, stripe);
+  RamCacheAdaptResult clfus  = test_RamCache_adaptivity(new_RamCacheCLFUS(), cache_size, stripe);
+  RamCacheAdaptResult wtlfu  = test_RamCache_adaptivity(new_RamCacheWTinyLFU(), cache_size, stripe);
+  RamCacheAdaptResult sieve  = test_RamCache_adaptivity(new_RamCacheSieve(), cache_size, stripe);
+  RamCacheAdaptResult s3fifo = test_RamCache_adaptivity(new_RamCacheS3FIFO(), cache_size, stripe);
+
+  rprintf(t, "RamCache adaptivity after working-set shift (higher B-hit-rate / lower A-retained is better)\n");
+  rprintf(t, "RamCache LRU      B-hit-rate %.3f  A-retained %d/%d\n", lru.b_hit_rate, lru.a_retained, lru.a_total);
+  rprintf(t, "RamCache CLFUS    B-hit-rate %.3f  A-retained %d/%d\n", clfus.b_hit_rate, clfus.a_retained, clfus.a_total);
+  rprintf(t, "RamCache WTinyLFU B-hit-rate %.3f  A-retained %d/%d\n", wtlfu.b_hit_rate, wtlfu.a_retained, wtlfu.a_total);
+  rprintf(t, "RamCache Sieve    B-hit-rate %.3f  A-retained %d/%d\n", sieve.b_hit_rate, sieve.a_retained, sieve.a_total);
+  rprintf(t, "RamCache S3FIFO   B-hit-rate %.3f  A-retained %d/%d\n", s3fifo.b_hit_rate, s3fifo.a_retained, s3fifo.a_total);
+
+  // With the F2 fixes CLFUS must follow the shift: serve the new working set and release the stale one.
+  *pstatus = (clfus.b_hit_rate >= 0.90 && clfus.a_retained <= clfus.a_total / 3) ? REGRESSION_TEST_PASSED : REGRESSION_TEST_FAILED;
+}
+
+// Gradual-drift adaptivity: a rolling working set. Each round accesses a window of keys (a few
+// times each, so they stay hot and get admitted) and slides the window forward by a few keys.
+// Keys that roll off the trailing edge go cold while still carrying high hit counts; a policy
+// that never ages resident counts keeps that stale trailing edge and starves the leading edge.
+// Returns the hit rate on the current window over the second half of the run.
+static double
+test_RamCache_drift(RamCache *cache, int64_t cache_size, StripeSM *stripe)
+{
+  cache->init(cache_size, stripe);
+
+  int const cap    = static_cast<int>(cache_size / BUFFER_SIZE_FOR_INDEX(BUFFER_SIZE_INDEX_16K));
+  int const win    = cap * 3 / 4; // active working-set window (fits with room)
+  int const reps   = 2;           // accesses per key per round (keeps the window hot/admitted)
+  int const slide  = 3;           // keys retired and introduced per round
+  int const rounds = 40;
+
+  std::vector<Ptr<IOBufferData>> keep;
+  auto                           access = [&](uint64_t k) -> bool {
+    CryptoHash hash;
+    hash.u64[0] = (k << 32) + k;
+    hash.u64[1] = (k << 32) + k;
+    Ptr<IOBufferData> got;
+    if (cache->get(&hash, &got)) {
+      return true;
+    }
+    IOBufferData *d = THREAD_ALLOC(ioDataAllocator, this_thread());
+    d->alloc(BUFFER_SIZE_INDEX_16K);
+    memset(d->data(), 0, d->block_size());
+    keep.push_back(make_ptr(d));
+    cache->put(&hash, d, d->block_size());
+    return false;
+  };
+
+  int hits = 0, total = 0;
+  for (int r = 0; r < rounds; r++) {
+    uint64_t base = static_cast<uint64_t>(r) * slide; // window = [base, base + win)
+    for (int rep = 0; rep < reps; rep++) {
+      for (int i = 0; i < win; i++) {
+        bool hit = access(base + i);
+        if (r >= rounds / 2) {
+          total++;
+          hits += hit ? 1 : 0;
+        }
+      }
+    }
+    keep.clear();
+  }
+  return total ? static_cast<double>(hits) / total : 0.0;
+}
+
+REGRESSION_TEST(ram_cache_drift)(RegressionTest *t, int level, int *pstatus)
+{
+  if (REGRESSION_TEST_NIGHTLY > level) {
+    *pstatus = REGRESSION_TEST_PASSED;
+    return;
+  }
+  if (cacheProcessor.IsCacheEnabled() != CacheInitState::INITIALIZED) {
+    rprintf(t, "cache not initialized");
+    *pstatus = REGRESSION_TEST_FAILED;
+    return;
+  }
+
+  CacheKey  key;
+  StripeSM *stripe     = theCache->key_to_stripe(&key, "example.com"sv);
+  int64_t   cache_size = 1LL << 21; // 2 MB
+
+  double lru    = test_RamCache_drift(new_RamCacheLRU(), cache_size, stripe);
+  double clfus  = test_RamCache_drift(new_RamCacheCLFUS(), cache_size, stripe);
+  double wtlfu  = test_RamCache_drift(new_RamCacheWTinyLFU(), cache_size, stripe);
+  double sieve  = test_RamCache_drift(new_RamCacheSieve(), cache_size, stripe);
+  double s3fifo = test_RamCache_drift(new_RamCacheS3FIFO(), cache_size, stripe);
+
+  rprintf(t, "RamCache gradual-drift current-window hit rate (higher is better)\n");
+  rprintf(t, "RamCache LRU      drift-hit-rate %.3f\n", lru);
+  rprintf(t, "RamCache CLFUS    drift-hit-rate %.3f\n", clfus);
+  rprintf(t, "RamCache WTinyLFU drift-hit-rate %.3f\n", wtlfu);
+  rprintf(t, "RamCache Sieve    drift-hit-rate %.3f\n", sieve);
+  rprintf(t, "RamCache S3FIFO   drift-hit-rate %.3f\n", s3fifo);
+
+  // With the F2 fixes CLFUS must track a rolling working set, not freeze on the initial cohort.
+  *pstatus = (clfus >= 0.80) ? REGRESSION_TEST_PASSED : REGRESSION_TEST_FAILED;
+}
+
+// ---- Trace-replay benchmark -------------------------------------------------
+//
+// Replays one request trace through a RamCache and reports the hit rate over the second half
+// (after warmup). The same trace is replayed through every algorithm for an apples-to-apples
+// comparison. The trace is generated by default (a Zipf popularity core, a slowly drifting
+// popular set, a fraction of one-hit-wonders, and variable object sizes); if the environment
+// variable TS_RAMCACHE_TRACE names a file ("<decimal-key> [size-bytes]" per line) it is replayed
+// instead, so a captured production trace can be used (TS_RAMCACHE_SIZE_MB sets the cache size).
+
+struct RamTraceReq {
+  uint64_t key;
+  int      size_index;
+};
+
+static std::vector<RamTraceReq>
+generate_ram_trace(int64_t key_universe, int64_t n_requests, double one_hit_fraction)
+{
+  build_zipf();
+  ts::Random::seed(20240601);
+  int const size_choices[] = {BUFFER_SIZE_INDEX_8K, BUFFER_SIZE_INDEX_16K, BUFFER_SIZE_INDEX_16K, BUFFER_SIZE_INDEX_32K};
+
+  std::vector<RamTraceReq> trace;
+  trace.reserve(n_requests);
+  uint64_t next_unique = static_cast<uint64_t>(key_universe);
+  for (int64_t i = 0; i < n_requests; i++) {
+    RamTraceReq req;
+    if (ts::Random::drandom() < one_hit_fraction) {
+      req.key = next_unique++; // never-before-seen key (scan / long tail)
+    } else {
+      uint64_t rank  = static_cast<uint64_t>(get_zipf(ts::Random::drandom())) % key_universe;
+      uint64_t drift = (static_cast<uint64_t>(i) * (key_universe / 8)) / n_requests; // popular set drifts over time
+      req.key        = (rank + drift) % key_universe;
+    }
+    req.size_index = size_choices[req.key & 3];
+    trace.push_back(req);
+  }
+  return trace;
+}
+
+// ---- Streaming trace source -------------------------------------------------
+//
+// Reads a request trace sequentially without ever holding it in memory, so a trace far larger
+// than RAM can be replayed (production traces run to billions of records). Supported inputs:
+//   - libCacheSim "oracleGeneral" binary: packed 24-byte little-endian records
+//       { uint32 time; uint64 obj_id; uint32 obj_size; int64 next_access }   (".bin")
+//   - libCacheSim CSV export "time, object, size, next_access_vtime" with a '#' header (".csv")
+//   - whitespace text "<decimal-key> [size-bytes]" per line (any other extension)
+// Any of these may be zstd-compressed (".zst"): a binary ".zst" is decompressed in process via
+// libzstd when available (TS_RAMCACHE_TEST_HAVE_ZSTD), otherwise (and for text ".zst") it is
+// streamed through `zstd -dc`. This is test-only code reading a developer-supplied path.
+static bool
+has_suffix(const std::string &s, const char *suffix)
+{
+  size_t n = strlen(suffix);
+  return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
+}
+
+namespace
+{
+struct TraceSource {
+  FILE       *_f      = nullptr;
+  bool        _pipe   = false; // a ".zst" we did not decompress in process (shelling to `zstd -dc`)
+  bool        _binary = false; // 24-byte oracleGeneral records
+  bool        _csv    = false; // comma-separated, key is the 2nd field
+  bool        _zst    = false; // path ends in ".zst"
+  std::string _path;
+#if TS_RAMCACHE_TEST_HAVE_ZSTD
+  // In-process zstd streaming (binary traces only): no temp file, no shell, low memory footprint.
+  ZSTD_DStream     *_zds = nullptr;
+  FILE             *_zf  = nullptr; // raw compressed input
+  std::vector<char> _zin_buf;
+  ZSTD_inBuffer     _zin    = {nullptr, 0, 0};
+  bool              _zeof   = false;
+  bool              _inproc = false;
+#endif
+
+  explicit TraceSource(const char *path) : _path(path)
+  {
+    std::string inner = _path;
+    _zst              = has_suffix(inner, ".zst");
+    if (_zst) {
+      inner.resize(inner.size() - 4);
+    }
+    // libCacheSim oracleGeneral binaries are named ".oracleGeneral" or ".oracleGeneral.bin".
+    _binary = has_suffix(inner, ".bin") || has_suffix(inner, ".oracleGeneral");
+    _csv    = has_suffix(inner, ".csv");
+    _open();
+  }
+  ~TraceSource() { _close(); }
+  TraceSource(const TraceSource &)            = delete;
+  TraceSource &operator=(const TraceSource &) = delete;
+
+  void
+  _open()
+  {
+    if (_zst) {
+#if TS_RAMCACHE_TEST_HAVE_ZSTD
+      if (_binary) { // decompress the binary trace in process -- no temp file, no shell
+        _zf = fopen(_path.c_str(), "rb");
+        if (_zf) {
+          _zds = ZSTD_createDStream();
+          ZSTD_initDStream(_zds);
+          _zin_buf.resize(ZSTD_DStreamInSize());
+          _inproc = true;
+          return;
+        }
+      }
+#endif
+      // Fallback (and text ".zst"): stream decompressed bytes through `zstd -dc`. Quote the path
+      // (test-only, trusted input) and refuse a path containing a quote rather than run unsafely.
+      std::string cmd = "zstd -dcq '" + _path + "'";
+      _pipe           = true;
+      _f              = _path.find('\'') == std::string::npos ? popen(cmd.c_str(), "r") : nullptr;
+    } else {
+      _f = fopen(_path.c_str(), _binary ? "rb" : "r");
+    }
+  }
+  void
+  _close()
+  {
+#if TS_RAMCACHE_TEST_HAVE_ZSTD
+    if (_zds) {
+      ZSTD_freeDStream(_zds);
+      _zds = nullptr;
+    }
+    if (_zf) {
+      fclose(_zf);
+      _zf = nullptr;
+    }
+#endif
+    if (_f) {
+      _pipe ? pclose(_f) : fclose(_f);
+      _f = nullptr;
+    }
+  }
+
+  // Fills dst with up to n decompressed bytes; returns the number actually read (< n at EOF).
+  size_t
+  _raw_read(void *dst, size_t n)
+  {
+#if TS_RAMCACHE_TEST_HAVE_ZSTD
+    if (_inproc) {
+      ZSTD_outBuffer out = {dst, n, 0};
+      while (out.pos < n) {
+        if (_zin.pos == _zin.size && !_zeof) {
+          size_t r  = fread(_zin_buf.data(), 1, _zin_buf.size(), _zf);
+          _zin.src  = _zin_buf.data();
+          _zin.size = r;
+          _zin.pos  = 0;
+          if (r == 0) {
+            _zeof = true;
+          }
+        }
+        size_t before = out.pos;
+        size_t ret    = ZSTD_decompressStream(_zds, &out, &_zin);
+        if (ZSTD_isError(ret)) {
+          break;
+        }
+        if (out.pos == before && _zin.pos == _zin.size && _zeof) {
+          break; // no input left and no progress made
+        }
+      }
+      return out.pos;
+    }
+#endif
+    return _f ? fread(dst, 1, n, _f) : 0;
+  }
+
+  // Yields the next record's key and object size in bytes; false at end of stream.
+  bool
+  next(uint64_t &key, int64_t &size_bytes)
+  {
+    if (_binary) {
+      unsigned char rec[24];
+      if (_raw_read(rec, sizeof(rec)) != sizeof(rec)) {
+        return false;
+      }
+      uint64_t obj_id;
+      uint32_t obj_size;
+      memcpy(&obj_id, rec + 4, 8);
+      memcpy(&obj_size, rec + 12, 4);
+      key        = obj_id;
+      size_bytes = obj_size ? obj_size : 1;
+      return true;
+    }
+    if (!_f) {
+      return false;
+    }
+    char line[512];
+    while (fgets(line, sizeof(line), _f)) {
+      if (line[0] == '#' || line[0] == '\n' || line[0] == '\0') {
+        continue;
+      }
+      unsigned long long k  = 0;
+      long long          sz = 0;
+      // CSV "time, object, size, ...": key is field 2. Text "<key> [size]": key is field 1.
+      int got = _csv ? sscanf(line, " %*[^,], %llu , %lld", &k, &sz) : sscanf(line, " %llu %lld", &k, &sz);
+      if (got >= 1) {
+        key        = k;
+        size_bytes = sz > 0 ? sz : 1;
+        return true;
+      }
+    }
+    return false;
+  }
+};
+} // namespace
+
+// Counts the records in a trace (capped at max_reqs) to locate the warmup midpoint. For an
+// uncompressed oracleGeneral ".bin" this is the file size / 24; otherwise it takes one streaming
+// pass (cheap next to the replay, which does cache work per record).
+static int64_t
+ram_trace_count(const char *path, int64_t max_reqs)
+{
+  std::string p = path;
+  // An uncompressed oracleGeneral binary is seekable: count = size / 24, no scan needed.
+  if (!has_suffix(p, ".zst") && (has_suffix(p, ".bin") || has_suffix(p, ".oracleGeneral"))) {
+    struct stat st;
+    if (stat(path, &st) == 0) {
+      int64_t recs = st.st_size / 24;
+      return recs < max_reqs ? recs : max_reqs;
+    }
+  }
+  TraceSource src(path);
+  uint64_t    key;
+  int64_t     sz, count = 0;
+  while (count < max_reqs && src.next(key, sz)) {
+    count++;
+  }
+  return count;
+}
+
+static double
+test_RamCache_trace(RamCache *cache, int64_t cache_size, StripeSM *stripe, const std::vector<RamTraceReq> &trace)
+{
+  cache->init(cache_size, stripe);
+  std::vector<Ptr<IOBufferData>> keep;
+  int64_t                        hits = 0, total = 0;
+  size_t                         measure_from = trace.size() / 2; // warm up over the first half
+  for (size_t i = 0; i < trace.size(); i++) {
+    uint64_t   k = trace[i].key;
+    CryptoHash hash;
+    hash.u64[0] = k; // preserve the full 64-bit object id (real traces use the whole range)
+    hash.u64[1] = k * 0x9e3779b97f4a7c15ull;
+    Ptr<IOBufferData> got;
+    bool              hit = cache->get(&hash, &got);
+    if (i >= measure_from) {
+      total++;
+      hits += hit ? 1 : 0;
+    }
+    if (!hit) {
+      IOBufferData *d = THREAD_ALLOC(ioDataAllocator, this_thread());
+      d->alloc(trace[i].size_index); // content is never read (compression off), so skip memset
+      keep.push_back(make_ptr(d));
+      cache->put(&hash, d, d->block_size());
+    }
+    if ((i & 0xfff) == 0xfff) {
+      keep.clear(); // bound transient memory; the cache holds its own refs to resident objects
+    }
+  }
+  keep.clear();
+  return total ? static_cast<double>(hits) / total : 0.0;
+}
+
+// Streaming counterpart to test_RamCache_trace: replays a file trace in a single pass without
+// materializing it, measuring the hit rate over the second half. total_records is precomputed
+// (see ram_trace_count) so the per-algorithm runs need not re-count. Mirrors the vector version's
+// keying and put logic exactly, so the two agree on identical input.
+static double
+test_RamCache_trace_stream(RamCache *cache, int64_t cache_size, StripeSM *stripe, const char *path, int64_t total_records)
+{
+  cache->init(cache_size, stripe);
+  int64_t                        measure_from = total_records / 2; // warm up over the first half
+  TraceSource                    src(path);
+  std::vector<Ptr<IOBufferData>> keep;
+  int64_t                        hits = 0, total = 0;
+  uint64_t                       k  = 0;
+  int64_t                        sz = 0;
+  for (int64_t i = 0; i < total_records && src.next(k, sz); i++) {
+    if (sz > (1 << 20)) {
+      sz = 1 << 20; // clamp huge objects so the allocator stays bounded
+    }
+    int        size_index = static_cast<int>(iobuffer_size_to_index(sz, MAX_BUFFER_SIZE_INDEX));
+    CryptoHash hash;
+    hash.u64[0] = k; // preserve the full 64-bit object id (real traces use the whole range)
+    hash.u64[1] = k * 0x9e3779b97f4a7c15ull;
+    Ptr<IOBufferData> got;
+    bool              hit = cache->get(&hash, &got);
+    if (i >= measure_from) {
+      total++;
+      hits += hit ? 1 : 0;
+    }
+    if (!hit) {
+      IOBufferData *d = THREAD_ALLOC(ioDataAllocator, this_thread());
+      d->alloc(size_index); // content is never read (compression off), so skip memset
+      keep.push_back(make_ptr(d));
+      cache->put(&hash, d, d->block_size());
+    }
+    if ((i & 0xfff) == 0xfff) {
+      keep.clear(); // bound transient memory; the cache holds its own refs to resident objects
+    }
+  }
+  keep.clear();
+  return total ? static_cast<double>(hits) / total : 0.0;
+}
+
+REGRESSION_TEST(ram_cache_trace)(RegressionTest *t, int level, int *pstatus)
+{
+  if (REGRESSION_TEST_NIGHTLY > level) {
+    *pstatus = REGRESSION_TEST_PASSED;
+    return;
+  }
+  if (cacheProcessor.IsCacheEnabled() != CacheInitState::INITIALIZED) {
+    rprintf(t, "cache not initialized");
+    *pstatus = REGRESSION_TEST_FAILED;
+    return;
+  }
+
+  CacheKey  cachekey;
+  StripeSM *stripe = theCache->key_to_stripe(&cachekey, "example.com"sv);
+
+  // TS_RAMCACHE_ALG selects a single algorithm (lru/clfus/wtinylfu); unset runs all three. Each
+  // algorithm leaks its cache (there is no teardown), so for very large caches set TS_RAMCACHE_ALG
+  // and TS_RAMCACHE_SIZE_MB and run one algorithm per invocation -- then only one cache is resident.
+  const char *alg     = getenv("TS_RAMCACHE_ALG");
+  auto        run_one = [&](const char *want, const char *disp, RamCache *(*mk)(), int64_t cache_size,
+                     const std::vector<RamTraceReq> &trace) {
+    if (alg && strcmp(alg, want) != 0) {
+      return;
+    }
+    double r = test_RamCache_trace(mk(), cache_size, stripe, trace);
+    rprintf(t, "RamCache trace %-8s size=%lld MB hit-rate %.3f\n", disp, (long long)(cache_size >> 20), r);
+  };
+
+  if (char const *path = getenv("TS_RAMCACHE_TRACE")) {
+    int64_t cache_size = 1LL << 30; // 1 GB default
+    if (char const *sz = getenv("TS_RAMCACHE_SIZE_MB")) {
+      cache_size = atoll(sz) << 20;
+    }
+    // The trace is streamed, not loaded, so this caps run time, not memory (override with
+    // TS_RAMCACHE_MAXREQS). total_records is counted once and reused across the algorithms.
+    const char *cap_env       = getenv("TS_RAMCACHE_MAXREQS");
+    int64_t     max_reqs      = cap_env ? atoll(cap_env) : 40000000;
+    int64_t     total_records = ram_trace_count(path, max_reqs);
+    rprintf(t, "RamCache trace (streaming) reqs=%lld\n", (long long)total_records);
+    auto run_stream = [&](const char *want, const char *disp, RamCache *(*mk)()) {
+      if (alg && strcmp(alg, want) != 0) {
+        return;
+      }
+      double r = test_RamCache_trace_stream(mk(), cache_size, stripe, path, total_records);
+      rprintf(t, "RamCache trace %-8s size=%lld MB hit-rate %.3f\n", disp, (long long)(cache_size >> 20), r);
+    };
+    run_stream("lru", "LRU", new_RamCacheLRU);
+    run_stream("clfus", "CLFUS", new_RamCacheCLFUS);
+    run_stream("wtinylfu", "WTinyLFU", new_RamCacheWTinyLFU);
+    run_stream("sieve", "Sieve", new_RamCacheSieve);
+    run_stream("s3fifo", "S3FIFO", new_RamCacheS3FIFO);
+    *pstatus = REGRESSION_TEST_PASSED;
+    return;
+  }
+
+  std::vector<int64_t> sizes;
+  if (char const *sz = getenv("TS_RAMCACHE_SIZE_MB")) {
+    sizes.push_back(atoll(sz) << 20);
+  } else {
+    sizes = {64LL << 20, 1LL << 30}; // 64 MB, 1 GB
+  }
+  for (int64_t cache_size : sizes) {
+    int64_t obj_est      = cache_size / (18 * 1024); // ~18 KB average object
+    int64_t key_universe = obj_est * 4;              // working set ~4x the cache
+    int64_t n_requests   = key_universe * 8;
+
+    std::vector<RamTraceReq> trace = generate_ram_trace(key_universe, n_requests, 0.10); // 10% one-hit-wonders
+    rprintf(t, "RamCache trace size=%lld MB universe=%lld reqs=%lld 10%%-one-hit\n", (long long)(cache_size >> 20),
+            (long long)key_universe, (long long)n_requests);
+    run_one("lru", "LRU", new_RamCacheLRU, cache_size, trace);
+    run_one("clfus", "CLFUS", new_RamCacheCLFUS, cache_size, trace);
+    run_one("wtinylfu", "WTinyLFU", new_RamCacheWTinyLFU, cache_size, trace);
+    run_one("sieve", "Sieve", new_RamCacheSieve, cache_size, trace);
+    run_one("s3fifo", "S3FIFO", new_RamCacheS3FIFO, cache_size, trace);
+  }
+  *pstatus = REGRESSION_TEST_PASSED; // informational comparison
+}
+
+// ---- Scan resistance --------------------------------------------------------
+//
+// A small hot set is kept hot while a long stream of unique, one-time keys (a scan) flows past.
+// A scan-resistant policy keeps the hot set resident instead of letting the scan evict it; this
+// reports the hot set's hit rate over the second half. W-TinyLFU resists scans via TinyLFU
+// admission; LRU and CLFUS via the seen filter.
+static double
+test_RamCache_scan(RamCache *cache, int64_t cache_size, StripeSM *stripe)
+{
+  cache->init(cache_size, stripe);
+
+  int const cap            = static_cast<int>(cache_size / BUFFER_SIZE_FOR_INDEX(BUFFER_SIZE_INDEX_16K));
+  int const nhot           = cap / 2; // hot set fits with room to spare
+  int const rounds         = 30;
+  int const scan_per_round = cap; // heavy scan pressure each round
+  uint64_t  scan_key       = 10000000;
+
+  std::vector<Ptr<IOBufferData>> keep;
+  auto                           access = [&](uint64_t k) -> bool {
+    CryptoHash hash;
+    hash.u64[0] = (k << 32) | (k & 0xffffffffu);
+    hash.u64[1] = hash.u64[0];
+    Ptr<IOBufferData> got;
+    if (cache->get(&hash, &got)) {
+      return true;
+    }
+    IOBufferData *d = THREAD_ALLOC(ioDataAllocator, this_thread());
+    d->alloc(BUFFER_SIZE_INDEX_16K);
+    memset(d->data(), 0, d->block_size());
+    keep.push_back(make_ptr(d));
+    cache->put(&hash, d, d->block_size());
+    return false;
+  };
+
+  int hits = 0, total = 0;
+  for (int r = 0; r < rounds; r++) {
+    for (int i = 0; i < nhot; i++) {
+      bool hit = access(1 + i); // hot keys [1, nhot]
+      if (r >= rounds / 2) {
+        total++;
+        hits += hit ? 1 : 0;
+      }
+    }
+    for (int s = 0; s < scan_per_round; s++) {
+      access(scan_key++); // unique one-time keys
+    }
+    keep.clear();
+  }
+  return total ? static_cast<double>(hits) / total : 0.0;
+}
+
+REGRESSION_TEST(ram_cache_scan)(RegressionTest *t, int level, int *pstatus)
+{
+  if (REGRESSION_TEST_NIGHTLY > level) {
+    *pstatus = REGRESSION_TEST_PASSED;
+    return;
+  }
+  if (cacheProcessor.IsCacheEnabled() != CacheInitState::INITIALIZED) {
+    rprintf(t, "cache not initialized");
+    *pstatus = REGRESSION_TEST_FAILED;
+    return;
+  }
+
+  CacheKey  key;
+  StripeSM *stripe     = theCache->key_to_stripe(&key, "example.com"sv);
+  int64_t   cache_size = 1LL << 23; // 8 MB
+
+  double lru    = test_RamCache_scan(new_RamCacheLRU(), cache_size, stripe);
+  double clfus  = test_RamCache_scan(new_RamCacheCLFUS(), cache_size, stripe);
+  double wtlfu  = test_RamCache_scan(new_RamCacheWTinyLFU(), cache_size, stripe);
+  double sieve  = test_RamCache_scan(new_RamCacheSieve(), cache_size, stripe);
+  double s3fifo = test_RamCache_scan(new_RamCacheS3FIFO(), cache_size, stripe);
+
+  rprintf(t, "RamCache scan resistance: hot-set hit rate under heavy one-time scan (higher is better)\n");
+  rprintf(t, "RamCache LRU      scan-hot-hit-rate %.3f\n", lru);
+  rprintf(t, "RamCache CLFUS    scan-hot-hit-rate %.3f\n", clfus);
+  rprintf(t, "RamCache WTinyLFU scan-hot-hit-rate %.3f\n", wtlfu);
+  rprintf(t, "RamCache Sieve    scan-hot-hit-rate %.3f\n", sieve);
+  rprintf(t, "RamCache S3FIFO   scan-hot-hit-rate %.3f\n", s3fifo);
+
+  *pstatus = REGRESSION_TEST_PASSED; // informational comparison
+}
+
+// ---- Throughput -------------------------------------------------------------
+//
+// Reports nanoseconds per get (all hits) and per put (all misses/inserts) on a filled cache, to
+// compare the per-operation cost of each policy (e.g. W-TinyLFU's sketch update on every get).
+static void
+test_RamCache_throughput(RegressionTest *t, RamCache *cache, const char *name, int64_t cache_size, StripeSM *stripe)
+{
+  cache->init(cache_size, stripe);
+  int const cap = static_cast<int>(cache_size / BUFFER_SIZE_FOR_INDEX(BUFFER_SIZE_INDEX_16K));
+
+  std::vector<Ptr<IOBufferData>> keep;
+  auto                           make_key = [](uint64_t k) {
+    CryptoHash hash;
+    hash.u64[0] = (k << 32) | (k & 0xffffffffu);
+    hash.u64[1] = hash.u64[0];
+    return hash;
+  };
+  auto put_k = [&](uint64_t k) {
+    CryptoHash    hash = make_key(k);
+    IOBufferData *d    = THREAD_ALLOC(ioDataAllocator, this_thread());
+    d->alloc(BUFFER_SIZE_INDEX_16K);
+    memset(d->data(), 0, d->block_size());
+    keep.push_back(make_ptr(d));
+    cache->put(&hash, d, d->block_size());
+  };
+
+  for (int i = 0; i < cap; i++) { // fill so gets are hits
+    put_k(static_cast<uint64_t>(i));
+  }
+  keep.clear();
+
+  constexpr int N = 2000000;
+  using clk       = std::chrono::steady_clock;
+
+  uint64_t acc = 0;
+  auto     g0  = clk::now();
+  for (int i = 0; i < N; i++) {
+    CryptoHash        hash = make_key(static_cast<uint64_t>(i % cap));
+    Ptr<IOBufferData> got;
+    acc += cache->get(&hash, &got);
+  }
+  double get_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - g0).count() / static_cast<double>(N);
+
+  uint64_t pk = 100000000;
+  auto     p0 = clk::now();
+  for (int i = 0; i < N; i++) {
+    put_k(pk++);
+    if ((i & 0xfff) == 0xfff) {
+      keep.clear();
+    }
+  }
+  double put_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - p0).count() / static_cast<double>(N);
+
+  keep.clear();
+  rprintf(t, "RamCache throughput %-8s get %.1f ns/op  put %.1f ns/op  (checksum %" PRIu64 ")\n", name, get_ns, put_ns, acc);
+}
+
+REGRESSION_TEST(ram_cache_throughput)(RegressionTest *t, int level, int *pstatus)
+{
+  if (REGRESSION_TEST_NIGHTLY > level) {
+    *pstatus = REGRESSION_TEST_PASSED;
+    return;
+  }
+  if (cacheProcessor.IsCacheEnabled() != CacheInitState::INITIALIZED) {
+    rprintf(t, "cache not initialized");
+    *pstatus = REGRESSION_TEST_FAILED;
+    return;
+  }
+
+  CacheKey  key;
+  StripeSM *stripe     = theCache->key_to_stripe(&key, "example.com"sv);
+  int64_t   cache_size = 1LL << 28; // 256 MB
+
+  test_RamCache_throughput(t, new_RamCacheLRU(), "LRU", cache_size, stripe);
+  test_RamCache_throughput(t, new_RamCacheCLFUS(), "CLFUS", cache_size, stripe);
+  test_RamCache_throughput(t, new_RamCacheWTinyLFU(), "WTinyLFU", cache_size, stripe);
+  test_RamCache_throughput(t, new_RamCacheSieve(), "Sieve", cache_size, stripe);
+  test_RamCache_throughput(t, new_RamCacheS3FIFO(), "S3FIFO", cache_size, stripe);
+
+  *pstatus = REGRESSION_TEST_PASSED; // informational comparison
 }
