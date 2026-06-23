@@ -91,7 +91,7 @@ zstd_dctx()
 
 // The compression type is stored in the 3-bit RamCacheCLFUSEntry
 // flag_bits.compressed field; a new codec value must still fit.
-static_assert(CACHE_COMPRESSION_ZSTD < (1 << 3));
+static_assert(static_cast<uint8_t>(CacheCompression::zstd) < (1 << 3));
 
 #define REQUIRED_COMPRESSION 0.9 // must get to this size or declared incompressible
 #define REQUIRED_SHRINK      0.8 // must get to this size or keep original buffer (with padding)
@@ -148,24 +148,24 @@ public:
 int
 RamCacheCLFUSCompressor::mainEvent(int /* event ATS_UNUSED */, Event *e)
 {
-  switch (cache_config_ram_cache_compress) {
+  switch (static_cast<CacheCompression>(cache_config_ram_cache_compress)) {
   default:
     Warning("unknown RAM cache compression type: %d", cache_config_ram_cache_compress);
-  case CACHE_COMPRESSION_NONE:
-  case CACHE_COMPRESSION_FASTLZ:
-  case CACHE_COMPRESSION_LIBZ:
+  case CacheCompression::None:
+  case CacheCompression::FastLZ:
+  case CacheCompression::DEFLATE:
     break;
-  case CACHE_COMPRESSION_LIBLZMA:
+  case CacheCompression::LZMA:
 #ifndef HAVE_LZMA_H
     Warning("lzma not available for RAM cache compression");
 #endif
     break;
-  case CACHE_COMPRESSION_LZ4:
+  case CacheCompression::LZ4:
 #ifndef HAVE_LZ4_H
     Warning("lz4 not available for RAM cache compression");
 #endif
     break;
-  case CACHE_COMPRESSION_ZSTD:
+  case CacheCompression::zstd:
 #ifndef HAVE_ZSTD_H
     Warning("zstd not available for RAM cache compression");
 #endif
@@ -283,53 +283,53 @@ RamCacheCLFUS::get(CryptoHash *key, Ptr<IOBufferData> *ret_data, uint64_t auxkey
           this->_lru[e->flag_bits.lru].enqueue(e);
         }
         e->hits++;
-        uint32_t ram_hit_state = RAM_HIT_COMPRESS_NONE;
+        RamHitCompress ram_hit_state = RamHitCompress::None;
         if (e->flag_bits.compressed) {
           b = static_cast<char *>(ats_malloc(e->len));
-          switch (e->flag_bits.compressed) {
+          switch (static_cast<CacheCompression>(e->flag_bits.compressed)) {
           default:
             goto Lfailed;
-          case CACHE_COMPRESSION_FASTLZ: {
+          case CacheCompression::FastLZ: {
             int l = static_cast<int>(e->len);
             if ((l != fastlz_decompress(e->data->data(), e->compressed_len, b, l))) {
               goto Lfailed;
             }
-            ram_hit_state = RAM_HIT_COMPRESS_FASTLZ;
+            ram_hit_state = RamHitCompress::FastLZ;
             break;
           }
-          case CACHE_COMPRESSION_LIBZ: {
+          case CacheCompression::DEFLATE: {
             uLongf l = e->len;
             if (Z_OK !=
                 uncompress(reinterpret_cast<Bytef *>(b), &l, reinterpret_cast<Bytef *>(e->data->data()), e->compressed_len)) {
               goto Lfailed;
             }
-            ram_hit_state = RAM_HIT_COMPRESS_LIBZ;
+            ram_hit_state = RamHitCompress::DEFLATE;
             break;
           }
 #ifdef HAVE_LZMA_H
-          case CACHE_COMPRESSION_LIBLZMA: {
+          case CacheCompression::LZMA: {
             size_t   l = static_cast<size_t>(e->len), ipos = 0, opos = 0;
             uint64_t memlimit = e->len * 2 + LZMA_BASE_MEMLIMIT;
             if (LZMA_OK != lzma_stream_buffer_decode(&memlimit, 0, nullptr, reinterpret_cast<uint8_t *>(e->data->data()), &ipos,
                                                      e->compressed_len, reinterpret_cast<uint8_t *>(b), &opos, l)) {
               goto Lfailed;
             }
-            ram_hit_state = RAM_HIT_COMPRESS_LIBLZMA;
+            ram_hit_state = RamHitCompress::LZMA;
             break;
           }
 #endif
 #ifdef HAVE_LZ4_H
-          case CACHE_COMPRESSION_LZ4: {
+          case CacheCompression::LZ4: {
             int l = static_cast<int>(e->len);
             if (l != LZ4_decompress_safe(e->data->data(), b, e->compressed_len, l)) {
               goto Lfailed;
             }
-            ram_hit_state = RAM_HIT_COMPRESS_LZ4;
+            ram_hit_state = RamHitCompress::LZ4;
             break;
           }
 #endif
 #ifdef HAVE_ZSTD_H
-          case CACHE_COMPRESSION_ZSTD: {
+          case CacheCompression::zstd: {
             size_t     l    = static_cast<size_t>(e->len);
             ZSTD_DCtx *dctx = zstd_dctx();
             if (dctx == nullptr) {
@@ -342,7 +342,7 @@ RamCacheCLFUS::get(CryptoHash *key, Ptr<IOBufferData> *ret_data, uint64_t auxkey
             if (ZSTD_isError(ll) || l != ll) {
               goto Lfailed;
             }
-            ram_hit_state = RAM_HIT_COMPRESS_ZSTD;
+            ram_hit_state = RamHitCompress::zstd;
             break;
           }
 #endif
@@ -371,7 +371,7 @@ RamCacheCLFUS::get(CryptoHash *key, Ptr<IOBufferData> *ret_data, uint64_t auxkey
         ts::Metrics::Counter::increment(cache_rsb.ram_cache_hits);
         ts::Metrics::Counter::increment(stripe->cache_vol->vol_rsb.ram_cache_hits);
         DDbg(dbg_ctl_ram_cache, "get %X %" PRId64 " size %d HIT", key->slice32(3), auxkey, e->size);
-        return ram_hit_state;
+        return static_cast<uint8_t>(ram_hit_state);
       } else {
         ts::Metrics::Counter::increment(cache_rsb.ram_cache_misses);
         ts::Metrics::Counter::increment(stripe->cache_vol->vol_rsb.ram_cache_misses);
@@ -510,30 +510,30 @@ RamCacheCLFUS::compress_entries(EThread *thread, int do_at_most)
       break;
     }
     {
-      e->compressed_len = e->size;
-      uint32_t l        = 0;
-      int      ctype    = cache_config_ram_cache_compress;
+      e->compressed_len      = e->size;
+      uint32_t         l     = 0;
+      CacheCompression ctype = static_cast<CacheCompression>(cache_config_ram_cache_compress);
       switch (ctype) {
       default:
         goto Lcontinue;
-      case CACHE_COMPRESSION_FASTLZ:
+      case CacheCompression::FastLZ:
         l = static_cast<uint32_t>(static_cast<double>(e->len) * 1.05 + 66);
         break;
-      case CACHE_COMPRESSION_LIBZ:
+      case CacheCompression::DEFLATE:
         l = static_cast<uint32_t>(compressBound(e->len));
         break;
 #ifdef HAVE_LZMA_H
-      case CACHE_COMPRESSION_LIBLZMA:
+      case CacheCompression::LZMA:
         l = static_cast<uint32_t>(lzma_stream_buffer_bound(e->len));
         break;
 #endif
 #ifdef HAVE_LZ4_H
-      case CACHE_COMPRESSION_LZ4:
+      case CacheCompression::LZ4:
         l = static_cast<uint32_t>(LZ4_compressBound(e->len));
         break;
 #endif
 #ifdef HAVE_ZSTD_H
-      case CACHE_COMPRESSION_ZSTD:
+      case CacheCompression::zstd:
         l = static_cast<uint32_t>(ZSTD_compressBound(e->len));
         break;
 #endif
@@ -548,7 +548,7 @@ RamCacheCLFUS::compress_entries(EThread *thread, int do_at_most)
       switch (ctype) {
       default:
         goto Lfailed;
-      case CACHE_COMPRESSION_FASTLZ:
+      case CacheCompression::FastLZ:
         if (e->len < 16) {
           goto Lfailed;
         }
@@ -556,7 +556,7 @@ RamCacheCLFUS::compress_entries(EThread *thread, int do_at_most)
           failed = true;
         }
         break;
-      case CACHE_COMPRESSION_LIBZ: {
+      case CacheCompression::DEFLATE: {
         uLongf ll = l;
         if ((Z_OK != compress(reinterpret_cast<Bytef *>(b), &ll, reinterpret_cast<Bytef *>(edata->data()), elen))) {
           failed = true;
@@ -565,7 +565,7 @@ RamCacheCLFUS::compress_entries(EThread *thread, int do_at_most)
         break;
       }
 #ifdef HAVE_LZMA_H
-      case CACHE_COMPRESSION_LIBLZMA: {
+      case CacheCompression::LZMA: {
         size_t pos = 0, ll = l;
         if (LZMA_OK != lzma_easy_buffer_encode(LZMA_PRESET_DEFAULT, LZMA_CHECK_NONE, nullptr,
                                                reinterpret_cast<uint8_t *>(edata->data()), elen, reinterpret_cast<uint8_t *>(b),
@@ -577,7 +577,7 @@ RamCacheCLFUS::compress_entries(EThread *thread, int do_at_most)
       }
 #endif
 #ifdef HAVE_LZ4_H
-      case CACHE_COMPRESSION_LZ4: {
+      case CacheCompression::LZ4: {
         int ll = l;
         if ((l = LZ4_compress_default(edata->data(), b, elen, ll)) == 0) {
           failed = true;
@@ -586,7 +586,7 @@ RamCacheCLFUS::compress_entries(EThread *thread, int do_at_most)
       }
 #endif
 #ifdef HAVE_ZSTD_H
-      case CACHE_COMPRESSION_ZSTD: {
+      case CacheCompression::zstd: {
         ZSTD_CCtx *cctx = zstd_cctx();
         if (cctx == nullptr) {
           failed = true;

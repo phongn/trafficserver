@@ -44,27 +44,27 @@ namespace
 // A compression backend to exercise, along with the RAM_HIT_* state get()
 // should report once a compressible object has been stored compressed.
 struct CompressionCase {
-  int         config;       // CACHE_COMPRESSION_*
-  int         expected_hit; // RAM_HIT_COMPRESS_* reported by get() for compressible data
-  const char *name;
+  CacheCompression config;
+  RamHitCompress   expected_hit; // RAM_HIT_COMPRESS_* reported by get() for compressible data
+  const char      *name;
 };
 
 std::vector<CompressionCase>
 compression_cases()
 {
   std::vector<CompressionCase> cases{
-    {CACHE_COMPRESSION_NONE,   RAM_HIT_COMPRESS_NONE,   "none"  },
-    {CACHE_COMPRESSION_FASTLZ, RAM_HIT_COMPRESS_FASTLZ, "fastlz"},
-    {CACHE_COMPRESSION_LIBZ,   RAM_HIT_COMPRESS_LIBZ,   "libz"  },
+    {CacheCompression::None,    RamHitCompress::None,    "none"  },
+    {CacheCompression::FastLZ,  RamHitCompress::FastLZ,  "fastlz"},
+    {CacheCompression::DEFLATE, RamHitCompress::DEFLATE, "libz"  },
   };
 #ifdef HAVE_LZMA_H
-  cases.push_back({CACHE_COMPRESSION_LIBLZMA, RAM_HIT_COMPRESS_LIBLZMA, "liblzma"});
+  cases.push_back({CacheCompression::LZMA, RamHitCompress::LZMA, "liblzma"});
 #endif
 #ifdef HAVE_LZ4_H
-  cases.push_back({CACHE_COMPRESSION_LZ4, RAM_HIT_COMPRESS_LZ4, "lz4"});
+  cases.push_back({CacheCompression::LZ4, RamHitCompress::LZ4, "lz4"});
 #endif
 #ifdef HAVE_ZSTD_H
-  cases.push_back({CACHE_COMPRESSION_ZSTD, RAM_HIT_COMPRESS_ZSTD, "zstd"});
+  cases.push_back({CacheCompression::zstd, RamHitCompress::zstd, "zstd"});
 #endif
   return cases;
 }
@@ -136,7 +136,7 @@ incompressible_bytes(std::size_t len)
 }
 
 struct RoundtripResult {
-  int               hit         = 0;
+  RamHitCompress    hit         = RamHitCompress::None;
   int64_t           size_before = 0; // rc.size() after put, before the compression pass
   int64_t           size_after  = 0; // rc.size() after the compression pass
   std::vector<char> out;
@@ -145,11 +145,11 @@ struct RoundtripResult {
 // Store payload under a fresh key, force a synchronous compression pass with
 // `config`, then read it back.
 RoundtripResult
-store_compress_get(StripeSM &stripe, int config, const std::vector<char> &payload)
+store_compress_get(StripeSM &stripe, CacheCompression config, const std::vector<char> &payload)
 {
   // Initialize with compression disabled so init() does not schedule the
   // background compressor (which would retain a pointer to this stack object).
-  cache_config_ram_cache_compress         = CACHE_COMPRESSION_NONE;
+  cache_config_ram_cache_compress         = static_cast<uint8_t>(CacheCompression::None);
   cache_config_ram_cache_compress_percent = 100;
   cache_config_ram_cache_use_seen_filter  = 0;
 
@@ -170,13 +170,13 @@ store_compress_get(StripeSM &stripe, int config, const std::vector<char> &payloa
   RoundtripResult r;
 
   r.size_before                   = rc.size();
-  cache_config_ram_cache_compress = config;
+  cache_config_ram_cache_compress = static_cast<uint8_t>(config);
   rc.compress_entries(this_ethread());
   r.size_after = rc.size();
 
   Ptr<IOBufferData> ret;
 
-  r.hit = rc.get(&key, &ret);
+  r.hit = static_cast<RamHitCompress>(rc.get(&key, &ret));
   REQUIRE(ret.get() != nullptr);
   r.out.assign(ret->data(), ret->data() + len);
   return r;
@@ -192,7 +192,7 @@ TEST_CASE("CLFUS compressible objects roundtrip cleanly", "[cache][ramcache][com
   CacheVol cache_vol;
   wire_stripe(stripe, cache_vol);
 
-  // Large enough to exercise the *_compressBound() arithmetic and uint32_t
+  // Large enough to exercise the *_comCompressionCasepressBound() arithmetic and uint32_t
   // casts in compress_entries(), not just small-buffer paths.
   auto                  payload = compressible_bytes(256 * 1024);
   const CompressionCase c       = GENERATE(from_range(compression_cases()));
@@ -202,7 +202,7 @@ TEST_CASE("CLFUS compressible objects roundtrip cleanly", "[cache][ramcache][com
 
   CHECK(r.hit == c.expected_hit);
   CHECK(r.out == payload);
-  if (c.config != CACHE_COMPRESSION_NONE) {
+  if (c.config != CacheCompression::None) {
     // The feature's contract is that compression saves memory, not merely
     // that the entry is tagged compressed.
     CHECK(r.size_after < r.size_before);
@@ -229,7 +229,7 @@ TEST_CASE("CLFUS incompressible objects fall back to uncompressed storage", "[ca
   RoundtripResult r = store_compress_get(stripe, c.config, payload);
 
   // Incompressible data is kept verbatim, so a read reports no compression.
-  CHECK(r.hit == RAM_HIT_COMPRESS_NONE);
+  CHECK(r.hit == RamHitCompress::None);
   CHECK(r.out == payload);
 }
 
@@ -241,9 +241,9 @@ TEST_CASE("CLFUS single-byte payload roundtrips", "[cache][ramcache][compress]")
   CacheVol cache_vol;
   wire_stripe(stripe, cache_vol);
 
-  RoundtripResult r = store_compress_get(stripe, CACHE_COMPRESSION_NONE, compressible_bytes(1));
+  RoundtripResult r = store_compress_get(stripe, CacheCompression::None, compressible_bytes(1));
 
-  CHECK(r.hit == RAM_HIT_COMPRESS_NONE);
+  CHECK(r.hit == RamHitCompress::None);
   CHECK(r.out == compressible_bytes(1));
 }
 

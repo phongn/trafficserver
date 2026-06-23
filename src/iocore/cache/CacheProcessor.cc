@@ -1488,12 +1488,12 @@ CacheProcessor::cacheInitialized()
     if (gnstripes) {
       // new ram_caches, with algorithm from the config
       for (int i = 0; i < gnstripes; i++) {
-        switch (cache_config_ram_cache_algorithm) {
+        switch (static_cast<RamCacheAlgorithm>(cache_config_ram_cache_algorithm)) {
         default:
-        case RAM_CACHE_ALGORITHM_CLFUS:
+        case RamCacheAlgorithm::CLFUS:
           gstripes[i]->ram_cache = new_RamCacheCLFUS();
           break;
-        case RAM_CACHE_ALGORITHM_LRU:
+        case RamCacheAlgorithm::LRU:
           gstripes[i]->ram_cache = new_RamCacheLRU();
           break;
         }
@@ -1638,25 +1638,25 @@ CacheProcessor::cacheInitialized()
         used_direntries += vol_used_direntries;
       }
 
-      switch (cache_config_ram_cache_compress) {
+      switch (static_cast<CacheCompression>(cache_config_ram_cache_compress)) {
       default:
         Fatal("unknown RAM cache compression type: %d", cache_config_ram_cache_compress);
-      case CACHE_COMPRESSION_NONE:
-      case CACHE_COMPRESSION_FASTLZ:
+      case CacheCompression::None:
+      case CacheCompression::FastLZ:
         break;
-      case CACHE_COMPRESSION_LIBZ:
+      case CacheCompression::DEFLATE:
         break;
-      case CACHE_COMPRESSION_LIBLZMA:
+      case CacheCompression::LZMA:
 #ifndef HAVE_LZMA_H
         Fatal("lzma not available for RAM cache compression");
 #endif
         break;
-      case CACHE_COMPRESSION_LZ4:
+      case CacheCompression::LZ4:
 #ifndef HAVE_LZ4_H
         Fatal("lz4 not available for RAM cache compression");
 #endif
         break;
-      case CACHE_COMPRESSION_ZSTD:
+      case CacheCompression::zstd:
 #ifndef HAVE_ZSTD_H
         Fatal("zstd not available for RAM cache compression");
 #endif

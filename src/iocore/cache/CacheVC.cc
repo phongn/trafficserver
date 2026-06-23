@@ -522,8 +522,8 @@ CacheVC::load_from_ram_cache()
 {
   int64_t o             = dir_offset(&this->dir);
   int     ram_hit_state = this->stripe->ram_cache->get(read_key, &this->buf, static_cast<uint64_t>(o));
-  f.compressed_in_ram   = (ram_hit_state > RAM_HIT_COMPRESS_NONE) ? 1 : 0;
-  return ram_hit_state >= RAM_HIT_COMPRESS_NONE;
+  f.compressed_in_ram   = (ram_hit_state > static_cast<uint8_t>(RamHitCompress::None)) ? 1 : 0;
+  return ram_hit_state > static_cast<uint8_t>(RamHitCompress::None);
 }
 
 bool

@@ -36,34 +36,20 @@ static constexpr ts::ModuleVersion CACHE_MODULE_VERSION(1, 0);
 
 #define SCAN_KB_PER_SECOND 8192 // 1TB/8MB = 131072 = 36 HOURS to scan a TB
 
-#define RAM_CACHE_ALGORITHM_CLFUS 0
-#define RAM_CACHE_ALGORITHM_LRU   1
+enum class RamCacheAlgorithm : uint8_t { CLFUS = 0, LRU };
 
-#define CACHE_COMPRESSION_NONE    0
-#define CACHE_COMPRESSION_FASTLZ  1
-#define CACHE_COMPRESSION_LIBZ    2
-#define CACHE_COMPRESSION_LIBLZMA 3
-#define CACHE_COMPRESSION_LZ4     4
-#define CACHE_COMPRESSION_ZSTD    5
+enum class CacheCompression : uint8_t { None = 0, FastLZ, DEFLATE, LZMA, LZ4, zstd };
 
-enum {
-  RAM_HIT_COMPRESS_NONE = 1,
-  RAM_HIT_COMPRESS_FASTLZ,
-  RAM_HIT_COMPRESS_LIBZ,
-  RAM_HIT_COMPRESS_LIBLZMA,
-  RAM_HIT_COMPRESS_LZ4,
-  RAM_HIT_COMPRESS_ZSTD,
-  RAM_HIT_LAST_ENTRY
-};
+enum class RamHitCompress : uint8_t { None = static_cast<uint8_t>(CacheCompression::None) + 1, FastLZ, DEFLATE, LZMA, LZ4, zstd };
 
-// The RAM_HIT_COMPRESS_* values are the CACHE_COMPRESSION_* values offset by
+// The RamHitCompress values are the CacheCompression values offset by
 // one; keep the two sequences from silently desyncing when a codec is added.
-static_assert(RAM_HIT_COMPRESS_NONE == CACHE_COMPRESSION_NONE + 1);
-static_assert(RAM_HIT_COMPRESS_FASTLZ == CACHE_COMPRESSION_FASTLZ + 1);
-static_assert(RAM_HIT_COMPRESS_LIBZ == CACHE_COMPRESSION_LIBZ + 1);
-static_assert(RAM_HIT_COMPRESS_LIBLZMA == CACHE_COMPRESSION_LIBLZMA + 1);
-static_assert(RAM_HIT_COMPRESS_LZ4 == CACHE_COMPRESSION_LZ4 + 1);
-static_assert(RAM_HIT_COMPRESS_ZSTD == CACHE_COMPRESSION_ZSTD + 1);
+static_assert(static_cast<uint8_t>(RamHitCompress::None) == static_cast<uint8_t>(CacheCompression::None) + 1);
+static_assert(static_cast<uint8_t>(RamHitCompress::FastLZ) == static_cast<uint8_t>(CacheCompression::FastLZ) + 1);
+static_assert(static_cast<uint8_t>(RamHitCompress::DEFLATE) == static_cast<uint8_t>(CacheCompression::DEFLATE) + 1);
+static_assert(static_cast<uint8_t>(RamHitCompress::LZMA) == static_cast<uint8_t>(CacheCompression::LZMA) + 1);
+static_assert(static_cast<uint8_t>(RamHitCompress::LZ4) == static_cast<uint8_t>(CacheCompression::LZ4) + 1);
+static_assert(static_cast<uint8_t>(RamHitCompress::zstd) == static_cast<uint8_t>(CacheCompression::zstd) + 1);
 
 struct CacheVC;
 class CacheEvacuateDocVC;
