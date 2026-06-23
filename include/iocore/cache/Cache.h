@@ -29,12 +29,23 @@
 
 static constexpr ts::ModuleVersion CACHE_MODULE_VERSION(1, 0);
 
-#define CACHE_WRITE_OPT_OVERWRITE      0x0001
-#define CACHE_WRITE_OPT_CLOSE_COMPLETE 0x0002
-#define CACHE_WRITE_OPT_SYNC           (CACHE_WRITE_OPT_CLOSE_COMPLETE | 0x0004)
-#define CACHE_WRITE_OPT_OVERWRITE_SYNC (CACHE_WRITE_OPT_SYNC | CACHE_WRITE_OPT_OVERWRITE)
+constexpr int scan_kb_per_second = 8192;
 
-#define SCAN_KB_PER_SECOND 8192 // 1TB/8MB = 131072 = 36 HOURS to scan a TB
+// Note: the old CACHE_WRITE_OPT_OVERWRITE_SYNC was removed as extraneous; you can
+// declare it via CacheWriteOpt::Overwrite & CacheWriteOpt::Sync
+enum class CacheWriteOpt : uint8_t { None = 0x0000, Overwrite = 0x0001, CloseComplete = 0x0002, Sync = 0x0002 | 0x0004 };
+
+inline constexpr CacheWriteOpt
+operator&(const CacheWriteOpt lhs, const int rhs) noexcept
+{
+  return static_cast<CacheWriteOpt>(static_cast<int>(lhs) & rhs);
+}
+
+inline constexpr CacheWriteOpt
+operator&(const CacheWriteOpt lhs, const CacheWriteOpt rhs) noexcept
+{
+  return static_cast<CacheWriteOpt>(static_cast<uint8_t>(lhs) & static_cast<uint8_t>(rhs));
+}
 
 enum class RamCacheAlgorithm : uint8_t { CLFUS = 0, LRU };
 
@@ -86,7 +97,7 @@ struct CacheProcessor : public Processor {
                      std::string_view hostname = std::string_view{});
   Action *remove(Continuation *cont, const CacheKey *key, CacheFragType frag_type = CACHE_FRAG_TYPE_NONE,
                  std::string_view hostname = std::string_view{});
-  Action *scan(Continuation *cont, std::string_view hostname = std::string_view{}, int KB_per_second = SCAN_KB_PER_SECOND);
+  Action *scan(Continuation *cont, std::string_view hostname = std::string_view{}, int KB_per_second = scan_kb_per_second);
   Action *lookup(Continuation *cont, const HttpCacheKey *key, CacheFragType frag_type = CACHE_FRAG_TYPE_HTTP);
   Action *open_read(Continuation *cont, const HttpCacheKey *key, CacheHTTPHdr *request, const HttpConfigAccessor *params,
                     CacheFragType frag_type = CACHE_FRAG_TYPE_HTTP, const CacheHostRecord *volume_host_rec = nullptr);

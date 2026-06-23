@@ -303,7 +303,8 @@ EXCLUSIVE_REGRESSION_TEST(cache)(RegressionTest *t, int /* atype ATS_UNUSED */, 
     return;
   }
 
-  CACHE_SM(t, write_test, { cacheProcessor.open_write(this, &key, CACHE_FRAG_TYPE_NONE, 100, CACHE_WRITE_OPT_SYNC); });
+  CACHE_SM(t, write_test,
+           { cacheProcessor.open_write(this, &key, CACHE_FRAG_TYPE_NONE, 100, static_cast<uint8_t>(CacheWriteOpt::Sync)); });
   write_test.expect_initial_event = CACHE_EVENT_OPEN_WRITE;
   write_test.expect_event         = VC_EVENT_WRITE_COMPLETE;
   write_test.nbytes               = 100;
@@ -337,7 +338,9 @@ EXCLUSIVE_REGRESSION_TEST(cache)(RegressionTest *t, int /* atype ATS_UNUSED */, 
 
   CACHE_SM(
     t, replace_write_test,
-    { cacheProcessor.open_write(this, &key, CACHE_FRAG_TYPE_NONE, 100, CACHE_WRITE_OPT_SYNC); } int open_write_callout() override {
+    {
+      cacheProcessor.open_write(this, &key, CACHE_FRAG_TYPE_NONE, 100, static_cast<uint8_t>(CacheWriteOpt::Sync));
+    } int open_write_callout() override {
       header.serial = 10;
       cache_vc->set_header(&header, sizeof(header));
       cvio = cache_vc->do_io_write(this, nbytes, buffer_reader);
@@ -350,19 +353,21 @@ EXCLUSIVE_REGRESSION_TEST(cache)(RegressionTest *t, int /* atype ATS_UNUSED */, 
 
   CACHE_SM(
     t, replace_test,
-    { cacheProcessor.open_write(this, &key, CACHE_FRAG_TYPE_NONE, 100, CACHE_WRITE_OPT_OVERWRITE_SYNC); } int open_write_callout()
-      override {
-        CacheTestHeader *h    = nullptr;
-        int              hlen = 0;
-        if (cache_vc->get_header((void **)&h, &hlen) < 0)
-          return -1;
-        if (h->serial != 10)
-          return -1;
-        header.serial = 11;
-        cache_vc->set_header(&header, sizeof(header));
-        cvio = cache_vc->do_io_write(this, nbytes, buffer_reader);
-        return 1;
-      });
+    {
+      cacheProcessor.open_write(this, &key, CACHE_FRAG_TYPE_NONE, 100,
+                                static_cast<uint8_t>(CacheWriteOpt::Overwrite & CacheWriteOpt::Sync));
+    } int open_write_callout() override {
+      CacheTestHeader *h    = nullptr;
+      int              hlen = 0;
+      if (cache_vc->get_header((void **)&h, &hlen) < 0)
+        return -1;
+      if (h->serial != 10)
+        return -1;
+      header.serial = 11;
+      cache_vc->set_header(&header, sizeof(header));
+      cvio = cache_vc->do_io_write(this, nbytes, buffer_reader);
+      return 1;
+    });
   replace_test.expect_initial_event = CACHE_EVENT_OPEN_WRITE;
   replace_test.expect_event         = VC_EVENT_WRITE_COMPLETE;
   replace_test.nbytes               = 100;
@@ -386,7 +391,8 @@ EXCLUSIVE_REGRESSION_TEST(cache)(RegressionTest *t, int /* atype ATS_UNUSED */, 
   replace_read_test.key                  = replace_test.key;
   replace_read_test.content_salt         = 1;
 
-  CACHE_SM(t, large_write_test, { cacheProcessor.open_write(this, &key, CACHE_FRAG_TYPE_NONE, 100, CACHE_WRITE_OPT_SYNC); });
+  CACHE_SM(t, large_write_test,
+           { cacheProcessor.open_write(this, &key, CACHE_FRAG_TYPE_NONE, 100, static_cast<uint8_t>(CacheWriteOpt::Sync)); });
   large_write_test.expect_initial_event = CACHE_EVENT_OPEN_WRITE;
   large_write_test.expect_event         = VC_EVENT_WRITE_COMPLETE;
   large_write_test.nbytes               = 10000000;

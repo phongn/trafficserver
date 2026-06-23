@@ -466,9 +466,9 @@ Cache::open_write(Continuation *cont, const CacheKey *key, CacheFragType frag_ty
   } while (DIR_MASK_TAG(c->key.slice32(2)) == DIR_MASK_TAG(c->first_key.slice32(2)));
   c->earliest_key     = c->key;
   c->info             = nullptr;
-  c->f.overwrite      = (options & CACHE_WRITE_OPT_OVERWRITE) != 0;
-  c->f.close_complete = (options & CACHE_WRITE_OPT_CLOSE_COMPLETE) != 0;
-  c->f.sync           = (options & CACHE_WRITE_OPT_SYNC) == CACHE_WRITE_OPT_SYNC;
+  c->f.overwrite      = (CacheWriteOpt::Overwrite & options) != CacheWriteOpt::None;
+  c->f.close_complete = (CacheWriteOpt::CloseComplete & options) != CacheWriteOpt::None;
+  c->f.sync           = (CacheWriteOpt::Sync & options) != CacheWriteOpt::None;
   // coverity[Y2K38_SAFETY:FALSE]
   c->pin_in_cache = static_cast<uint32_t>(apin_in_cache);
 
