@@ -43,7 +43,6 @@
 #include <cstddef>
 #include <cstdlib>
 #include <memory.h>
-#include <mutex>
 #include <new>
 #include <numeric>
 #include <unistd.h>
@@ -272,8 +271,6 @@ freelist_new(InkFreeList *f)
   head_p next;
   bool   result = false;
 
-  std::lock_guard guard{f->m};
-
   item = f->head.load();
 
   do {
@@ -329,7 +326,8 @@ freelist_new(InkFreeList *f)
     } else {
       void **next_ptr = to_voidp_p(TO_PTR(FREELIST_POINTER(item)), 0);
 
-      SET_FREELIST_POINTER_VERSION(next, *next_ptr, FREELIST_VERSION(item) + 1);
+      SET_FREELIST_POINTER_VERSION(next, std::atomic_ref<void *>(*next_ptr).load(std::memory_order_relaxed),
+                                   FREELIST_VERSION(item) + 1);
       result = f->head.compare_exchange_weak(item, next, std::memory_order_acquire, std::memory_order_acquire);
 
 #ifdef SANITY
@@ -404,7 +402,7 @@ freelist_free(InkFreeList *f, void *item)
   }
 #endif /* DEADBEEF */
 
-  recovered_item = new (item) void *{};
+  recovered_item = new (item) void *;
   h              = f->head.load();
   while (!result) {
 #ifdef SANITY
@@ -419,7 +417,7 @@ freelist_free(InkFreeList *f, void *item)
     }
 #endif /* SANITY */
 
-    *recovered_item = FREELIST_POINTER(h);
+    std::atomic_ref<void *>(*recovered_item).store(FREELIST_POINTER(h), std::memory_order_relaxed);
     SET_FREELIST_POINTER_VERSION(item_pair, FROM_PTR(recovered_item), FREELIST_VERSION(h));
 
     // This assertion has to happen-before the node is in the list and
@@ -494,8 +492,8 @@ freelist_bulkfree(InkFreeList *f, void *head, void *tail, [[maybe_unused]] size_
       dummy_forced_read(TO_PTR(FREELIST_POINTER(h)));
     }
 #endif /* SANITY */
-    recovered_tail  = new (tail) void *{};
-    *recovered_tail = FREELIST_POINTER(h);
+    recovered_tail = new (tail) void *;
+    std::atomic_ref<void *>(*recovered_tail).store(FREELIST_POINTER(h), std::memory_order_relaxed);
     SET_FREELIST_POINTER_VERSION(item_pair, FROM_PTR(head), FREELIST_VERSION(h));
     result = f->head.compare_exchange_weak(h, item_pair, std::memory_order_release, std::memory_order_relaxed);
   }
@@ -627,21 +625,20 @@ ink_atomiclist_pop(InkAtomicList *l)
   head_p next;
   bool   result = 0;
 
-  std::lock_guard guard{l->m};
-
   item = l->head.load();
   do {
     if (TO_PTR(FREELIST_POINTER(item)) == nullptr) {
       return nullptr;
     }
     void **next_ptr = to_voidp_p(reinterpret_cast<unsigned char *>(TO_PTR(FREELIST_POINTER(item))), l->offset);
-    SET_FREELIST_POINTER_VERSION(next, *next_ptr, FREELIST_VERSION(item) + 1);
+    SET_FREELIST_POINTER_VERSION(next, std::atomic_ref<void *>(*next_ptr).load(std::memory_order_relaxed),
+                                 FREELIST_VERSION(item) + 1);
     result = l->head.compare_exchange_weak(item, next);
   } while (result == false);
 
   void  *ret  = TO_PTR(FREELIST_POINTER(item));
   void **ret_ = to_voidp_p(reinterpret_cast<unsigned char *>(ret), l->offset);
-  *ret_       = nullptr;
+  std::atomic_ref<void *>(*ret_).store(nullptr, std::memory_order_relaxed);
   return ret;
 }
 
@@ -651,16 +648,6 @@ ink_atomiclist_popall(InkAtomicList *l)
   head_p item;
   head_p next;
   bool   result = false;
-
-  // Later in this routine, we need to walk the freelist chain to restore
-  // next pointers. Because `ink_atomiclist_pop` reads one of the pointers
-  // in the chain after loading the head, we need to mutually exclude
-  // the walk in this routine (which writes) from the read in
-  // `ink_atomiclist_pop`. We do not need to acquire the lock this early,
-  // but freelist benchmarks suggest that serializing pop operations is
-  // more efficient than CAS loops under contention in these types of
-  // data structures. We acquire the lock early for that reason.
-  std::lock_guard guard{l->m};
 
   item = l->head.load();
   do {
@@ -676,9 +663,9 @@ ink_atomiclist_popall(InkAtomicList *l)
   /* fixup forward pointers */
   while (e) {
     void **e_ = to_voidp_p(e, l->offset);
-    void  *n  = TO_PTR(*e_);
-    *e_       = n;
-    e         = n;
+    void  *n  = TO_PTR(std::atomic_ref<void *>(*e_).load(std::memory_order_relaxed));
+    std::atomic_ref<void *>(*e_).store(n, std::memory_order_relaxed);
+    e = n;
   }
 
   ink_assert(is_addr_aligned(ret, alignof(void *)));
@@ -702,8 +689,8 @@ ink_atomiclist_push(InkAtomicList *l, void *item)
     h = FREELIST_POINTER(head);
     ink_assert(item != TO_PTR(h));
 
-    recovered_item  = new (reinterpret_cast<unsigned char *>(item) + l->offset) void *{};
-    *recovered_item = FREELIST_POINTER(head);
+    recovered_item = new (reinterpret_cast<unsigned char *>(item) + l->offset) void *;
+    std::atomic_ref<void *>(*recovered_item).store(FREELIST_POINTER(head), std::memory_order_relaxed);
     SET_FREELIST_POINTER_VERSION(item_pair, FROM_PTR(item), FREELIST_VERSION(head));
     result = l->head.compare_exchange_weak(head, item_pair);
   } while (result == false);
@@ -717,7 +704,7 @@ ink_atomiclist_remove(InkAtomicList *l, void *item)
   head_p head;
   void  *prev      = nullptr;
   void **addr_next = to_voidp_p(item, l->offset);
-  void  *item_next = *addr_next;
+  void  *item_next = std::atomic_ref<void *>(*addr_next).load(std::memory_order_relaxed);
   bool   result    = 0;
 
   /*
@@ -730,7 +717,7 @@ ink_atomiclist_remove(InkAtomicList *l, void *item)
     result = l->head.compare_exchange_weak(head, next);
 
     if (result) {
-      *addr_next = nullptr;
+      std::atomic_ref<void *>(*addr_next).store(nullptr, std::memory_order_relaxed);
       return item;
     }
   }
@@ -742,11 +729,11 @@ ink_atomiclist_remove(InkAtomicList *l, void *item)
   while (prev) {
     void **prev_adr_of_next = to_voidp_p(prev, l->offset);
     void  *prev_prev        = prev;
-    prev                    = TO_PTR(*prev_adr_of_next);
+    prev                    = TO_PTR(std::atomic_ref<void *>(*prev_adr_of_next).load(std::memory_order_relaxed));
     if (prev == item) {
       ink_assert(prev_prev != item_next);
-      *prev_adr_of_next = item_next;
-      *addr_next        = nullptr;
+      std::atomic_ref<void *>(*prev_adr_of_next).store(item_next, std::memory_order_relaxed);
+      std::atomic_ref<void *>(*addr_next).store(nullptr, std::memory_order_relaxed);
       return item;
     }
   }

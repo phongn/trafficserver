@@ -39,7 +39,6 @@
 
 #include <atomic>
 #include <cstring>
-#include <mutex>
 
 /*
   For information on the structure of the x86_64 memory map:
@@ -199,7 +198,6 @@ store_head(head_p &dest, head_p_view const src)
 #endif
 
 struct _InkFreeList {
-  std::mutex                 m;
   std::atomic<head_p>        head;
   const char                *name;
   std::atomic<std::uint32_t> used;
@@ -242,7 +240,6 @@ void  ink_freelists_snap_baseline();
 
 struct InkAtomicList {
   InkAtomicList() {}
-  std::mutex          m;
   std::atomic<head_p> head{};
   const char         *name   = nullptr;
   uint32_t            offset = 0;
