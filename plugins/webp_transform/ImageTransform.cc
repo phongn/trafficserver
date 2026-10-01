@@ -60,8 +60,16 @@ enum class ImageEncoding { webp, jpeg, png, unknown };
 bool config_convert_to_webp = false;
 bool config_convert_to_jpeg = false;
 
+// Encoder quality (1-100), overridable with the webp_quality/jpeg_quality
+// arguments. It is always explicit: inheriting the source's quality turns a
+// q100 JPEG into a lossless WebP and a lossless WebP into a q100 JPEG, both
+// larger than needed and far slower to encode.
+int config_webp_quality = 80;
+int config_jpeg_quality = 85;
+
 Stat stat_convert_to_webp;
 Stat stat_convert_to_jpeg;
+Stat stat_convert_to_png;
 
 bool
 has_signature_for(std::string_view data, ImageEncoding encoding)
@@ -158,6 +166,20 @@ constexpr size_t MAX_IMAGE_DIMENSION_PX = 16000;
 constexpr size_t MAX_IMAGE_AREA_PX      = 64ULL * 1024 * 1024;
 constexpr size_t MAX_PIXEL_CACHE_BYTES  = 512ULL * 1024 * 1024;
 
+// Parse an encoder quality (1-100) for the webp_quality/jpeg_quality
+// arguments. Returns -1 on malformed or out-of-range input.
+int
+parse_quality(const char *value)
+{
+  errno         = 0;
+  char *end     = nullptr;
+  long  quality = std::strtol(value, &end, 10);
+  if (errno != 0 || end == value || *end != '\0' || quality < 1 || quality > 100) {
+    return -1;
+  }
+  return static_cast<int>(quality);
+}
+
 // Map an encoding to the client-facing Content-Type it should be labeled with.
 const char *
 content_type_for(ImageEncoding encoding)
@@ -181,6 +203,7 @@ public:
   ImageTransform(Transaction &transaction, std::string input_content_type, ImageEncoding input_image_type,
                  ImageEncoding transform_image_type)
     : TransformationPlugin(transaction, TransformationPlugin::RESPONSE_TRANSFORMATION),
+      _txnp(static_cast<TSHttpTxn>(transaction.getAtsHandle())),
       _input_content_type(std::move(input_content_type)),
       _input_image_type(input_image_type),
       _transform_image_type(transform_image_type)
@@ -192,16 +215,8 @@ public:
   void
   handleReadResponseHeaders(Transaction &transaction) override
   {
-    // Label the server response so both the cached transform and the client
-    // copy carry the target type. On a degraded transform (pass-through or
-    // decode error) the body is the original encoding but the label still says
-    // the target; handleSendResponseHeaders below corrects the client-facing
-    // copy using _input_content_type in that case. The cached label can still
-    // end up wrong on a degraded transform; fixing that without mislabeling
-    // the cache is tracked as a separate correctness issue.
-    if (const char *ctype = content_type_for(_transform_image_type); ctype != nullptr) {
-      transaction.getServerResponse().getHeaders()["Content-Type"] = ctype;
-    }
+    // Content-Type is set by label_output() once the body is decoded, since
+    // only then is its final encoding known.
     transaction.getServerResponse().getHeaders()["Vary"] = "Accept"; // separate cache entry per Accept
     Dbg(webp_dbg_ctl, "url %s", transaction.getServerRequest().getUrl().getUrlString().c_str());
     transaction.resume();
@@ -220,19 +235,11 @@ public:
       Response &response = transaction.getClientResponse();
       response.setStatusCode(HTTP_STATUS_BAD_GATEWAY);
       response.setReasonPhrase("Bad Gateway");
-      // Drop the image labeling the read hook added for a conversion that did
-      // not happen; this is an empty error response, not an image.
+      // This is an empty error response, not an image.
       response.getHeaders().erase("Content-Type");
       response.getHeaders().erase("Vary");
       transaction.resume();
       return;
-    }
-
-    // Signature mismatch or decode failure reverted us to the original
-    // encoding (see pass_through()); relabel the client-facing response to
-    // match the body we actually sent.
-    if (_transform_image_type == _input_image_type) {
-      transaction.getClientResponse().getHeaders()["Content-Type"] = _input_content_type;
     }
     transaction.resume();
   }
@@ -273,7 +280,7 @@ public:
     if (!has_signature_for(_img, _input_image_type)) {
       TSError("[webp_transform] input body does not match its declared image encoding: %d, length: %zu",
               static_cast<int>(_input_image_type), _img.length());
-      pass_through(_img);
+      pass_through();
       setOutputComplete();
       return;
     }
@@ -284,24 +291,62 @@ public:
     try {
       image.read(input_blob);
 
-      Blob output_blob;
-      if (_transform_image_type == ImageEncoding::webp) {
-        stat_convert_to_webp.increment(1);
+      // JPEG cannot carry transparency, so a WebP with an alpha channel is
+      // sent as PNG instead.
+      ImageEncoding produced =
+        _transform_image_type == ImageEncoding::jpeg && image.alpha() ? ImageEncoding::png : _transform_image_type;
+      switch (produced) {
+      case ImageEncoding::webp:
         Dbg(webp_dbg_ctl, "Transforming jpeg or png to webp");
+        image.quality(config_webp_quality);
+        // Otherwise quality 100 silently switches the encoder to lossless.
+        image.defineValue("webp", "lossless", "false");
         image.magick("WEBP");
-      } else {
-        stat_convert_to_jpeg.increment(1);
+        break;
+      case ImageEncoding::jpeg:
         Dbg(webp_dbg_ctl, "Transforming webp to jpeg");
+        image.quality(config_jpeg_quality);
         image.magick("JPEG");
+        break;
+      default:
+        Dbg(webp_dbg_ctl, "Transforming webp with transparency to png");
+        // For PNG, quality selects the zlib level and filter; 75 is
+        // ImageMagick's own default (level 7, adaptive filtering), rather than
+        // the 100 a lossless WebP would otherwise carry over.
+        image.quality(75);
+        image.magick("PNG");
+        break;
       }
+
+      Blob output_blob;
       image.write(&output_blob);
-      produce(std::string_view(reinterpret_cast<const char *>(output_blob.data()), output_blob.length()));
+      std::string_view output(static_cast<const char *>(output_blob.data()), output_blob.length());
+      if (produced == ImageEncoding::webp && output.size() >= _img.size()) {
+        // The client accepts the original too, so never send it a re-encode
+        // that is no smaller (e.g. a low-quality source at a higher quality).
+        Dbg(webp_dbg_ctl, "webp is %zu bytes, original %zu; sending the original", output.size(), _img.size());
+        pass_through();
+      } else {
+        switch (produced) {
+        case ImageEncoding::webp:
+          stat_convert_to_webp.increment(1);
+          break;
+        case ImageEncoding::png:
+          stat_convert_to_png.increment(1);
+          break;
+        default:
+          stat_convert_to_jpeg.increment(1);
+          break;
+        }
+        label_output(content_type_for(produced));
+        produce(output);
+      }
     } catch (const Magick::Warning &warning) {
       TSError("ImageMagick++ warning: %s", warning.what());
-      pass_through(std::string_view(reinterpret_cast<const char *>(input_blob.data()), input_blob.length()));
+      pass_through();
     } catch (const Magick::Error &error) {
       TSError("ImageMagick++ error: %s _image_type: %d input length: %zu", error.what(), (int)_transform_image_type, _img.length());
-      pass_through(std::string_view(reinterpret_cast<const char *>(input_blob.data()), input_blob.length()));
+      pass_through();
     } catch (const std::exception &e) {
       // ImageMagick++ can throw other exception types (e.g.
       // std::bad_alloc on huge or malformed inputs). Catch them so an
@@ -310,11 +355,11 @@ public:
       // large inputs) is distinguishable from a one-off decode hiccup.
       TSError("[webp_transform] std::exception during transform: %s _image_type: %d input length: %zu", e.what(),
               (int)_transform_image_type, _img.length());
-      pass_through(std::string_view(reinterpret_cast<const char *>(input_blob.data()), input_blob.length()));
+      pass_through();
     } catch (...) {
       TSError("[webp_transform] unknown exception during transform _image_type: %d input length: %zu", (int)_transform_image_type,
               _img.length());
-      pass_through(std::string_view(reinterpret_cast<const char *>(input_blob.data()), input_blob.length()));
+      pass_through();
     }
 
     setOutputComplete();
@@ -323,15 +368,42 @@ public:
   ~ImageTransform() override = default;
 
 private:
+  // Set the Content-Type of what this transform sends. The client response
+  // and the cached copy are both built from the transform response when the
+  // first output is produced, so this must run before produce().
   void
-  pass_through(std::string_view data)
+  label_output(std::string_view content_type)
   {
-    if (!data.empty()) {
-      produce(data);
+    TSMBuffer bufp;
+    TSMLoc    hdr_loc;
+
+    if (TSHttpTxnTransformRespGet(_txnp, &bufp, &hdr_loc) != TS_SUCCESS) {
+      return;
     }
-    _transform_image_type = _input_image_type;
+    TSMLoc field = TSMimeHdrFieldFind(bufp, hdr_loc, TS_MIME_FIELD_CONTENT_TYPE, TS_MIME_LEN_CONTENT_TYPE);
+    if (field == TS_NULL_MLOC &&
+        TSMimeHdrFieldCreateNamed(bufp, hdr_loc, TS_MIME_FIELD_CONTENT_TYPE, TS_MIME_LEN_CONTENT_TYPE, &field) == TS_SUCCESS) {
+      TSMimeHdrFieldAppend(bufp, hdr_loc, field);
+    }
+    if (field != TS_NULL_MLOC) {
+      TSMimeHdrFieldValuesClear(bufp, hdr_loc, field);
+      TSMimeHdrFieldValueStringInsert(bufp, hdr_loc, field, -1, content_type.data(), content_type.size());
+      TSHandleMLocRelease(bufp, hdr_loc, field);
+    }
+    TSHandleMLocRelease(bufp, TS_NULL_MLOC, hdr_loc);
   }
 
+  // Send the original body, labeled with the origin's Content-Type.
+  void
+  pass_through()
+  {
+    label_output(_input_content_type);
+    if (!_img.empty()) {
+      produce(_img);
+    }
+  }
+
+  TSHttpTxn     _txnp;
   std::string   _img;
   std::string   _input_content_type;
   bool          _refused = false;
@@ -455,7 +527,9 @@ TSPluginInit(int argc, const char *argv[])
     return;
   }
 
-  constexpr std::string_view max_buffer_prefix = "max_buffer_size=";
+  constexpr std::string_view max_buffer_prefix   = "max_buffer_size=";
+  constexpr std::string_view webp_quality_prefix = "webp_quality=";
+  constexpr std::string_view jpeg_quality_prefix = "jpeg_quality=";
 
   bool convert_specified = false;
   for (int i = 1; i < argc; ++i) {
@@ -487,6 +561,19 @@ TSPluginInit(int argc, const char *argv[])
       }
       recognized = true;
     }
+    for (auto [prefix, target] : {
+           std::pair{webp_quality_prefix, &config_webp_quality},
+           std::pair{jpeg_quality_prefix, &config_jpeg_quality}
+    }) {
+      if (arg.substr(0, prefix.size()) == prefix) {
+        if (int quality = parse_quality(argv[i] + prefix.size()); quality < 0) {
+          TSError("[webp_transform] invalid %.*s, keeping default %d", static_cast<int>(arg.size()), arg.data(), *target);
+        } else {
+          *target = quality;
+        }
+        recognized = true;
+      }
+    }
     if (!recognized) {
       TSError("[webp_transform] unknown option: %.*s", static_cast<int>(arg.size()), arg.data());
     }
@@ -502,6 +589,8 @@ TSPluginInit(int argc, const char *argv[])
 
   stat_convert_to_webp.init("plugin." TAG ".convert_to_webp", Stat::SYNC_SUM, false);
   stat_convert_to_jpeg.init("plugin." TAG ".convert_to_jpeg", Stat::SYNC_SUM, false);
+  stat_convert_to_png.init("plugin." TAG ".convert_to_png", Stat::SYNC_SUM, false);
+  Dbg(webp_dbg_ctl, "webp_quality=%d jpeg_quality=%d", config_webp_quality, config_jpeg_quality);
 
   InitializeMagick("");
 

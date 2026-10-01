@@ -22,10 +22,13 @@
 Webp Transform Plugin
 *********************
 
-This plugin converts jpeg and png images and transforms them into webp format for browsers that support webp.
-Also, the plugin converts webp images and transforms them to jpeg for browsers that don't support webp
-All response with content-type 'image/jpeg' or 'image/png' will go through the transform.
-Content-type is changed to 'image/webp' or 'image/jpeg' on successful transformation.
+This plugin converts jpeg and png images to webp for clients that support webp,
+and converts webp images to jpeg (or png, when the image has transparency) for
+clients that don't. A client supports webp only if its ``Accept`` header lists
+``image/webp`` explicitly; ``image/*`` and ``*/*`` are treated as jpeg, gif and
+png only, as older browsers that sent them could not decode webp.
+
+The response's ``Content-Type`` always matches the body that is sent.
 
 Installation
 ============
@@ -33,6 +36,7 @@ Installation
 Add the following line to :file:`plugin.config`::
 
     webp_transform.so [convert_to_jpeg] [convert_to_webp] [max_buffer_size=<size>]
+                      [webp_quality=<1-100>] [jpeg_quality=<1-100>]
 
 
 Plugin Arguments
@@ -46,10 +50,19 @@ The plugin is configured with space-separated arguments. All are optional.
 
 ``convert_to_jpeg``
     Convert ``image/webp`` responses to ``image/jpeg`` for clients that do not
-    advertise ``image/webp``.
+    advertise ``image/webp``. A webp image with transparency is converted to
+    ``image/png`` instead, since jpeg cannot represent it.
 
     If neither ``convert_to_webp`` nor ``convert_to_jpeg`` is given, both
     conversions are enabled.
+
+``webp_quality=<1-100>``
+    Encoder quality for webp output. The default is 80. Output is always
+    lossy; the source image's quality is never carried over. If the webp is
+    not smaller than the original jpeg or png, the original is sent instead.
+
+``jpeg_quality=<1-100>``
+    Encoder quality for jpeg output. The default is 85.
 
 ``max_buffer_size=<size>``
     The maximum size of a single response body the plugin will buffer in memory
